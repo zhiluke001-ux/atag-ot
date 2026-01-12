@@ -16,6 +16,8 @@ import {
   type WorkRole,
 } from "@/lib/pricing";
 
+/* ---------------- Types ---------------- */
+
 type User = {
   id: string;
   name: string;
@@ -25,6 +27,7 @@ type User = {
 
 type Assignment = {
   id: string;
+  userId: string;
   status: "UNPAID" | "PAID";
   amountDefault: number;
   amountOverride: number | null;
@@ -43,12 +46,38 @@ type OtEvent = {
   assignments: Assignment[];
 };
 
+/* ---------------- Safe helpers ---------------- */
+
+function isTaskCode(x: unknown): x is TaskCode {
+  return typeof x === "string" && Object.prototype.hasOwnProperty.call(TASK_LABEL, x);
+}
+
+function isoDateOnly(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function hhmmFromIso(iso: string) {
+  const d = new Date(iso);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
 function safeParseSelection(taskCodes: string): TaskSelection {
   try {
-    const j = JSON.parse(taskCodes || "{}");
+    const j = JSON.parse(taskCodes || "{}") as any;
+
+    const rawCodes: unknown[] = Array.isArray(j?.codes) ? j.codes : [];
+    const codes: TaskCode[] = rawCodes.filter(isTaskCode);
+
+    const claim = (j?.claim ?? null) as ClaimCode | null;
+
     return {
-      claim: j?.claim ?? null,
-      codes: Array.isArray(j?.codes) ? j.codes : [],
+      claim,
+      codes,
       note: typeof j?.note === "string" ? j.note : "",
       baseRates: j?.baseRates ?? {},
       addOnRates: j?.addOnRates ?? {},
@@ -66,21 +95,8 @@ function safeParseSelection(taskCodes: string): TaskSelection {
   }
 }
 
-function isoDateOnly(d: Date) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+/* ---------------- Task + Pay breakdown (display only) ---------------- */
 
-function hhmmFromIso(iso: string) {
-  const d = new Date(iso);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-/** ---------- NEW: task+pay breakdown helpers (client-side display) ---------- */
 function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
@@ -91,7 +107,7 @@ function hoursBetween(start: Date, end: Date) {
   return round2(ms / (1000 * 60 * 60));
 }
 
-function toNum(v: any, fallback = 0) {
+function toNum(v: unknown, fallback = 0) {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -114,12 +130,14 @@ function buildTaskPayBreakdown(args: {
   // Base claim
   if (selection.claim) {
     const claim = selection.claim;
-    const base = resolveBaseRates(claim, selection);
+    const base = resolveBaseRates(claim, selection) as any;
 
-    // Hourly claim
-    if ((base as any)?.kind === "HOURLY" || claim === "EVENT_HOURLY") {
+    const baseKind = base?.kind as string | undefined;
+    const isHourly = baseKind === "HOURLY" || claim === "EVENT_HOURLY";
+
+    if (isHourly) {
       if (isMarshal) {
-        const rate = isSenior ? toNum((base as any).marshalSenior, 0) : toNum((base as any).marshalJunior, 0);
+        const rate = isSenior ? toNum(base?.marshalSenior, 0) : toNum(base?.marshalJunior, 0);
         const amt = round2(hrs * rate);
         if (amt > 0) {
           lines.push({
@@ -128,8 +146,7 @@ function buildTaskPayBreakdown(args: {
           });
         }
       } else if (isEmcee) {
-        // if someday you add emcee hourly rates, this will show too
-        const rate = isSenior ? toNum((base as any).emceeSenior, 0) : toNum((base as any).emceeJunior, 0);
+        const rate = isSenior ? toNum(base?.emceeSenior, 0) : toNum(base?.emceeJunior, 0);
         const amt = round2(hrs * rate);
         if (amt > 0) {
           lines.push({
@@ -139,51 +156,51 @@ function buildTaskPayBreakdown(args: {
         }
       }
     } else {
-      // Flat claim (Half Day / Full Day / 2D1N / 3D2N)
       if (isMarshal) {
-        const amt = round2(isSenior ? toNum((base as any).marshalSenior, 0) : toNum((base as any).marshalJunior, 0));
+        const amt = round2(isSenior ? toNum(base?.marshalSenior, 0) : toNum(base?.marshalJunior, 0));
         if (amt > 0) lines.push({ label: `Event - ${CLAIM_LABEL[claim]}`, amountRM: amt });
       }
       if (isEmcee) {
-        const amt = round2(isSenior ? toNum((base as any).emceeSenior, 0) : toNum((base as any).emceeJunior, 0));
+        const amt = round2(isSenior ? toNum(base?.emceeSenior, 0) : toNum(base?.emceeJunior, 0));
         if (amt > 0) lines.push({ label: `Event - ${CLAIM_LABEL[claim]}`, amountRM: amt });
       }
     }
   }
 
   // Add-ons
-  const add = resolveAddOnRates(selection);
+  const add = resolveAddOnRates(selection) as any;
   const startsAfter6pm = start.getHours() >= 18;
 
   for (const code of selection.codes || []) {
     if (code === "BACKEND_RM15") {
-      const rate = toNum((add as any).backendPerHour, 0);
+      const rate = toNum(add?.backendPerHour, 0);
       const amt = round2(hrs * rate);
       if (amt > 0) lines.push({ label: `Backend (${hrs}h × RM${rate}/hr)`, amountRM: amt });
     }
 
     if (code === "EVENT_AFTER_6PM") {
-      const rate = toNum((add as any).after6pmPerHour, 0);
+      const rate = toNum(add?.after6pmPerHour, 0);
       const appliedHrs = startsAfter6pm ? hrs : 0;
       const amt = round2(appliedHrs * rate);
       if (amt > 0) lines.push({ label: `Event starts after 6PM (${appliedHrs}h × RM${rate}/hr)`, amountRM: amt });
     }
 
     if (code === "EARLY_CALLING_RM30") {
-      const amt = round2(toNum((add as any).earlyCallingFlat, 0));
+      const amt = round2(toNum(add?.earlyCallingFlat, 0));
       if (amt > 0) lines.push({ label: "Early Calling", amountRM: amt });
     }
 
     if (code === "LOADING_UNLOADING_RM30") {
-      const amt = round2(toNum((add as any).loadingUnloadingFlat, 0));
+      const amt = round2(toNum(add?.loadingUnloadingFlat, 0));
       if (amt > 0) lines.push({ label: "Loading & Unloading", amountRM: amt });
     }
   }
 
   // Custom
   if (selection.custom?.enabled) {
-    const amt = round2(toNum(selection.custom.amount, 0));
-    if (amt > 0) lines.push({ label: selection.custom.label?.trim() ? selection.custom.label.trim() : "Custom", amountRM: amt });
+    const amt = round2(toNum((selection.custom as any).amount, 0));
+    const label = typeof (selection.custom as any).label === "string" ? (selection.custom as any).label.trim() : "";
+    if (amt > 0) lines.push({ label: label || "Custom", amountRM: amt });
   }
 
   const totalRM = round2(lines.reduce((s, x) => s + x.amountRM, 0));
@@ -195,7 +212,8 @@ function formatBreakdownInline(lines: { label: string; amountRM: number }[]) {
   return lines.map((x) => `${x.label} (RM${x.amountRM.toFixed(2)})`).join(" + ");
 }
 
-/** ---------- TaskModal ---------- */
+/* ---------------- Task Modal ---------------- */
+
 function TaskModal({
   open,
   onClose,
@@ -224,25 +242,10 @@ function TaskModal({
     unit: "perHour" | "flat";
     rateKey: keyof NonNullable<TaskSelection["addOnRates"]>;
   }[] = [
-    {
-      code: "BACKEND_RM15",
-      left: "Backend — Annual Dinner / Karaoke / Packing / Set Up",
-      unit: "perHour",
-      rateKey: "backendPerHour",
-    },
-    {
-      code: "EVENT_AFTER_6PM",
-      left: "Event starts after 6PM (RM30 | RM20 per hour)",
-      unit: "perHour",
-      rateKey: "after6pmPerHour",
-    },
+    { code: "BACKEND_RM15", left: "Backend — Annual Dinner / Karaoke / Packing / Set Up", unit: "perHour", rateKey: "backendPerHour" },
+    { code: "EVENT_AFTER_6PM", left: "Event starts after 6PM (RM30 | RM20 per hour)", unit: "perHour", rateKey: "after6pmPerHour" },
     { code: "EARLY_CALLING_RM30", left: "Early Calling", unit: "flat", rateKey: "earlyCallingFlat" },
-    {
-      code: "LOADING_UNLOADING_RM30",
-      left: "Loading & Unloading",
-      unit: "flat",
-      rateKey: "loadingUnloadingFlat",
-    },
+    { code: "LOADING_UNLOADING_RM30", left: "Loading & Unloading", unit: "flat", rateKey: "loadingUnloadingFlat" },
   ];
 
   function toggleCode(code: TaskCode) {
@@ -252,22 +255,22 @@ function TaskModal({
   }
 
   function setAddOnRate(key: string, value: string) {
-    const next = { ...(selection.addOnRates || {}) } as any;
+    const next = { ...(selection.addOnRates || {}) } as Record<string, string>;
     if (value.trim() === "") delete next[key];
     else next[key] = value;
-    setSelection({ ...selection, addOnRates: next });
+    setSelection({ ...selection, addOnRates: next as any });
   }
 
   function setBaseRate(key: string, value: string) {
-    const next = { ...(selection.baseRates || {}) } as any;
+    const next = { ...(selection.baseRates || {}) } as Record<string, string>;
     if (value.trim() === "") delete next[key];
     else next[key] = value;
-    setSelection({ ...selection, baseRates: next });
+    setSelection({ ...selection, baseRates: next as any });
   }
 
   const claim = selection.claim;
-  const base = claim ? resolveBaseRates(claim, selection) : null;
-  const add = resolveAddOnRates(selection);
+  const base = claim ? (resolveBaseRates(claim, selection) as any) : null;
+  const add = resolveAddOnRates(selection) as any;
 
   const showEmceeBase = claim === "EVENT_HALF_DAY" || claim === "EVENT_FULL_DAY";
   const showMarshalBase = claim !== null;
@@ -279,7 +282,7 @@ function TaskModal({
       addOnRates: {},
       custom: { enabled: false, label: "", amount: "" },
       note: "",
-    });
+    } as TaskSelection);
   }
 
   return (
@@ -291,12 +294,8 @@ function TaskModal({
             <div className="text-xs text-gray-600">Pick base claim (0 or 1) + tick add-ons. You can edit the RM amounts here.</div>
           </div>
           <div className="flex gap-2">
-            <button className="text-sm px-3 py-1.5 border rounded" onClick={resetDefaults}>
-              Reset
-            </button>
-            <button className="text-sm px-3 py-1.5 border rounded" onClick={onClose}>
-              Close
-            </button>
+            <button className="text-sm px-3 py-1.5 border rounded" onClick={resetDefaults}>Reset</button>
+            <button className="text-sm px-3 py-1.5 border rounded" onClick={onClose}>Close</button>
           </div>
         </div>
 
@@ -311,9 +310,7 @@ function TaskModal({
                     key={String(opt.value)}
                     type="button"
                     onClick={() => setSelection({ ...selection, claim: opt.value })}
-                    className={`px-3 py-1.5 rounded border text-sm ${
-                      active ? "bg-black text-white border-black" : "bg-white hover:bg-gray-50"
-                    }`}
+                    className={`px-3 py-1.5 rounded border text-sm ${active ? "bg-black text-white border-black" : "bg-white hover:bg-gray-50"}`}
                   >
                     {opt.label}
                   </button>
@@ -326,7 +323,7 @@ function TaskModal({
             <div className="border rounded-xl p-3">
               <div>
                 <div className="text-sm font-semibold">Base Pay — {CLAIM_LABEL[claim]}</div>
-                <div className="text-xs text-gray-600">{(base as any).kind === "HOURLY" ? "Marshal rates are per hour." : "Flat amount for the claim."}</div>
+                <div className="text-xs text-gray-600">{base?.kind === "HOURLY" ? "Marshal rates are per hour." : "Flat amount for the claim."}</div>
               </div>
 
               <div className="mt-3 grid md:grid-cols-2 gap-3">
@@ -337,13 +334,13 @@ function TaskModal({
                       <label className="text-xs text-gray-600">Senior (RM)</label>
                       <input
                         className="border rounded px-2 py-1 text-right"
-                        value={String((selection.baseRates as any)?.marshalSenior ?? (base as any).marshalSenior)}
+                        value={String((selection.baseRates as any)?.marshalSenior ?? base?.marshalSenior ?? "")}
                         onChange={(e) => setBaseRate("marshalSenior", e.target.value)}
                       />
                       <label className="text-xs text-gray-600">Junior (RM)</label>
                       <input
                         className="border rounded px-2 py-1 text-right"
-                        value={String((selection.baseRates as any)?.marshalJunior ?? (base as any).marshalJunior)}
+                        value={String((selection.baseRates as any)?.marshalJunior ?? base?.marshalJunior ?? "")}
                         onChange={(e) => setBaseRate("marshalJunior", e.target.value)}
                       />
                     </div>
@@ -357,14 +354,14 @@ function TaskModal({
                     <input
                       disabled={!showEmceeBase}
                       className="border rounded px-2 py-1 text-right disabled:opacity-60"
-                      value={String((selection.baseRates as any)?.emceeSenior ?? (base as any).emceeSenior)}
+                      value={String((selection.baseRates as any)?.emceeSenior ?? base?.emceeSenior ?? "")}
                       onChange={(e) => setBaseRate("emceeSenior", e.target.value)}
                     />
                     <label className="text-xs text-gray-600">Junior (RM)</label>
                     <input
                       disabled={!showEmceeBase}
                       className="border rounded px-2 py-1 text-right disabled:opacity-60"
-                      value={String((selection.baseRates as any)?.emceeJunior ?? (base as any).emceeJunior)}
+                      value={String((selection.baseRates as any)?.emceeJunior ?? base?.emceeJunior ?? "")}
                       onChange={(e) => setBaseRate("emceeJunior", e.target.value)}
                     />
                   </div>
@@ -384,12 +381,12 @@ function TaskModal({
                 const current =
                   (selection.addOnRates as any)?.[row.rateKey] ??
                   (row.rateKey === "backendPerHour"
-                    ? (add as any).backendPerHour
+                    ? add?.backendPerHour
                     : row.rateKey === "after6pmPerHour"
-                    ? (add as any).after6pmPerHour
+                    ? add?.after6pmPerHour
                     : row.rateKey === "earlyCallingFlat"
-                    ? (add as any).earlyCallingFlat
-                    : (add as any).loadingUnloadingFlat);
+                    ? add?.earlyCallingFlat
+                    : add?.loadingUnloadingFlat);
 
                 return (
                   <div key={row.code} className="border rounded-lg p-3 flex items-center justify-between gap-3">
@@ -405,8 +402,8 @@ function TaskModal({
                       <span className="text-sm text-gray-600">RM</span>
                       <input
                         className="w-24 border rounded px-2 py-1 text-right"
-                        value={String(current)}
-                        onChange={(e) => setAddOnRate(row.rateKey, e.target.value)}
+                        value={String(current ?? "")}
+                        onChange={(e) => setAddOnRate(String(row.rateKey), e.target.value)}
                       />
                     </div>
                   </div>
@@ -430,8 +427,8 @@ function TaskModal({
                       custom: {
                         enabled: e.target.checked,
                         label: selection.custom?.label || "",
-                        amount: selection.custom?.amount ?? "",
-                      },
+                        amount: (selection.custom as any)?.amount ?? "",
+                      } as any,
                     })
                   }
                 />
@@ -448,8 +445,8 @@ function TaskModal({
                     custom: {
                       enabled: !!selection.custom?.enabled,
                       label: e.target.value,
-                      amount: selection.custom?.amount ?? "",
-                    },
+                      amount: (selection.custom as any)?.amount ?? "",
+                    } as any,
                   })
                 }
               />
@@ -459,7 +456,7 @@ function TaskModal({
                 <input
                   className="w-28 border rounded px-2 py-1 text-right"
                   placeholder="0"
-                  value={String(selection.custom?.amount ?? "")}
+                  value={String((selection.custom as any)?.amount ?? "")}
                   onChange={(e) =>
                     setSelection({
                       ...selection,
@@ -467,7 +464,7 @@ function TaskModal({
                         enabled: !!selection.custom?.enabled,
                         label: selection.custom?.label || "",
                         amount: e.target.value,
-                      },
+                      } as any,
                     })
                   }
                 />
@@ -491,16 +488,15 @@ function TaskModal({
         </div>
 
         <div className="sticky bottom-0 bg-white z-10 border-t p-4 flex justify-end">
-          <button className="px-4 py-2 border rounded" onClick={onClose}>
-            Done
-          </button>
+          <button className="px-4 py-2 border rounded" onClick={onClose}>Done</button>
         </div>
       </div>
     </div>
   );
 }
 
-/** ---------- Page ---------- */
+/* ---------------- Page ---------------- */
+
 export default function ApprovedOTAdminPage() {
   const [users, setUsers] = useState<User[]>([]);
   const [events, setEvents] = useState<OtEvent[]>([]);
@@ -521,8 +517,8 @@ export default function ApprovedOTAdminPage() {
     note: "",
     baseRates: {},
     addOnRates: {},
-    custom: { enabled: false, label: "", amount: "" },
-  } as any);
+    custom: { enabled: false, label: "", amount: "" } as any,
+  } as TaskSelection);
 
   // chosen users + role per user + overrides
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
@@ -596,8 +592,8 @@ export default function ApprovedOTAdminPage() {
       note: "",
       baseRates: {},
       addOnRates: {},
-      custom: { enabled: false, label: "", amount: "" },
-    } as any);
+      custom: { enabled: false, label: "", amount: "" } as any,
+    } as TaskSelection);
     setSelectedUserIds([]);
     setRoleByUserId({});
     setOverrides({});
@@ -616,20 +612,16 @@ export default function ApprovedOTAdminPage() {
     const sel = safeParseSelection(ev.taskCodes || "{}");
     setSelection(sel);
 
-    // select users from assignments
-    const ids = ev.assignments.map((a) => (a as any).userId).filter(Boolean) as string[];
+    const ids = ev.assignments.map((a) => a.userId).filter(Boolean);
     setSelectedUserIds(ids);
 
-    // roles from assignments
     const roles: Record<string, WorkRole> = {};
     const ovs: Record<string, string> = {};
     for (const a of ev.assignments) {
-      const uid = (a as any).userId as string | undefined;
-      if (uid) {
-        roles[uid] = a.workRole;
-        if (a.amountOverride !== null && a.amountOverride !== undefined) {
-          ovs[uid] = (Number(a.amountOverride) / 100).toFixed(2);
-        }
+      const uid = a.userId;
+      roles[uid] = a.workRole;
+      if (a.amountOverride !== null && a.amountOverride !== undefined) {
+        ovs[uid] = (Number(a.amountOverride) / 100).toFixed(2);
       }
     }
     setRoleByUserId(roles);
@@ -696,7 +688,7 @@ export default function ApprovedOTAdminPage() {
     await loadAll();
   }
 
-  async function patchAssignment(id: string, patch: any) {
+  async function patchAssignment(id: string, patch: unknown) {
     const res = await fetch(`/api/admin/assignments/${id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -714,9 +706,10 @@ export default function ApprovedOTAdminPage() {
     const parts: string[] = [];
     parts.push(selection.claim ? CLAIM_LABEL[selection.claim] : "None");
     const codes = (selection.codes ?? []) as TaskCode[];
-if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
-
-    if (selection.custom?.enabled && selection.custom.amount) parts.push(`Custom: ${selection.custom.label || "Item"} (RM${selection.custom.amount})`);
+    if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
+    if (selection.custom?.enabled && (selection.custom as any)?.amount) {
+      parts.push(`Custom: ${(selection.custom as any).label || "Item"} (RM${(selection.custom as any).amount})`);
+    }
     if (selection.note) parts.push(`Note: ${selection.note}`);
     return parts.join(" · ");
   }, [selection]);
@@ -869,8 +862,8 @@ if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
 
           const selSummary = [
             sel.claim ? CLAIM_LABEL[sel.claim] : "None",
-            sel.codes?.length ? (sel.codes as TaskCode[]).map((c) => TASK_LABEL[c]).join(" + ") : null,
-            sel.custom?.enabled ? `Custom: ${sel.custom.label || "Item"} (RM${sel.custom.amount})` : null,
+            sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
+            sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
             sel.note ? `Note: ${sel.note}` : null,
           ]
             .filter(Boolean)
@@ -933,10 +926,7 @@ if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
 
                             <td className="p-2 text-xs min-w-[280px]">
                               <div className="text-gray-800">{inline}</div>
-                              {/* optional: show computed total vs stored default */}
-                              <div className="text-[11px] text-gray-500 mt-1">
-                                Breakdown total: RM{breakdown.totalRM.toFixed(2)}
-                              </div>
+                              <div className="text-[11px] text-gray-500 mt-1">Breakdown total: RM{breakdown.totalRM.toFixed(2)}</div>
                             </td>
 
                             <td className="p-2 text-right">RM{centsToRm(defaultCents)}</td>
