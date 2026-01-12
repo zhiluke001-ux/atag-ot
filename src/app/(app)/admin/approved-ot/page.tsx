@@ -95,7 +95,7 @@ function safeParseSelection(taskCodes: string): TaskSelection {
   }
 }
 
-/* ---------------- Task + Pay breakdown (display only) ---------------- */
+/* ---------------- Task + Pay breakdown (display + export) ---------------- */
 
 function round2(n: number) {
   return Math.round(n * 100) / 100;
@@ -212,6 +212,34 @@ function formatBreakdownInline(lines: { label: string; amountRM: number }[]) {
   return lines.map((x) => `${x.label} (RM${x.amountRM.toFixed(2)})`).join(" + ");
 }
 
+function toLocalDate(d: Date) {
+  return d.toLocaleDateString();
+}
+function toLocalTime(d: Date) {
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/* ---------------- CSV Export helpers ---------------- */
+
+function csvEscape(v: unknown) {
+  const s = String(v ?? "");
+  // if contains comma, quote or newline -> wrap in quotes and escape quotes
+  if (/[,"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function downloadTextFile(filename: string, content: string, mime = "text/csv;charset=utf-8") {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /* ---------------- Task Modal ---------------- */
 
 function TaskModal({
@@ -287,15 +315,19 @@ function TaskModal({
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
-      <div className="w-full max-w-3xl bg-white rounded-2xl border shadow-sm flex flex-col max-h-[90vh]">
-        <div className="sticky top-0 bg-white z-10 border-b p-4 flex items-center justify-between">
+      <div className="w-full max-w-3xl bg-white rounded-2xl border-2 border-black shadow-sm flex flex-col max-h-[90vh] text-gray-900">
+        <div className="sticky top-0 bg-white z-10 border-b-2 border-black p-4 flex items-center justify-between">
           <div>
             <div className="font-semibold">Select Task Description</div>
-            <div className="text-xs text-gray-600">Pick base claim (0 or 1) + tick add-ons. You can edit the RM amounts here.</div>
+            <div className="text-xs text-gray-700">Pick base claim (0 or 1) + tick add-ons. You can edit the RM amounts here.</div>
           </div>
           <div className="flex gap-2">
-            <button className="text-sm px-3 py-1.5 border rounded" onClick={resetDefaults}>Reset</button>
-            <button className="text-sm px-3 py-1.5 border rounded" onClick={onClose}>Close</button>
+            <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={resetDefaults}>
+              Reset
+            </button>
+            <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={onClose}>
+              Close
+            </button>
           </div>
         </div>
 
@@ -310,7 +342,9 @@ function TaskModal({
                     key={String(opt.value)}
                     type="button"
                     onClick={() => setSelection({ ...selection, claim: opt.value })}
-                    className={`px-3 py-1.5 rounded border text-sm ${active ? "bg-black text-white border-black" : "bg-white hover:bg-gray-50"}`}
+                    className={`px-3 py-1.5 rounded border-2 text-sm ${
+                      active ? "bg-black text-white border-black" : "bg-white border-black text-gray-900 hover:bg-gray-50"
+                    }`}
                   >
                     {opt.label}
                   </button>
@@ -320,26 +354,26 @@ function TaskModal({
           </div>
 
           {claim && base && (
-            <div className="border rounded-xl p-3">
+            <div className="border-2 border-black rounded-xl p-3">
               <div>
                 <div className="text-sm font-semibold">Base Pay — {CLAIM_LABEL[claim]}</div>
-                <div className="text-xs text-gray-600">{base?.kind === "HOURLY" ? "Marshal rates are per hour." : "Flat amount for the claim."}</div>
+                <div className="text-xs text-gray-700">{base?.kind === "HOURLY" ? "Marshal rates are per hour." : "Flat amount for the claim."}</div>
               </div>
 
               <div className="mt-3 grid md:grid-cols-2 gap-3">
                 {showMarshalBase && (
-                  <div className="border rounded-lg p-3">
+                  <div className="border-2 border-black rounded-lg p-3">
                     <div className="text-sm font-semibold">Marshal</div>
                     <div className="mt-2 grid grid-cols-2 gap-2 items-center">
-                      <label className="text-xs text-gray-600">Senior (RM)</label>
+                      <label className="text-xs text-gray-700">Senior (RM)</label>
                       <input
-                        className="border rounded px-2 py-1 text-right"
+                        className="border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
                         value={String((selection.baseRates as any)?.marshalSenior ?? base?.marshalSenior ?? "")}
                         onChange={(e) => setBaseRate("marshalSenior", e.target.value)}
                       />
-                      <label className="text-xs text-gray-600">Junior (RM)</label>
+                      <label className="text-xs text-gray-700">Junior (RM)</label>
                       <input
-                        className="border rounded px-2 py-1 text-right"
+                        className="border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
                         value={String((selection.baseRates as any)?.marshalJunior ?? base?.marshalJunior ?? "")}
                         onChange={(e) => setBaseRate("marshalJunior", e.target.value)}
                       />
@@ -347,33 +381,33 @@ function TaskModal({
                   </div>
                 )}
 
-                <div className={`border rounded-lg p-3 ${showEmceeBase ? "" : "opacity-50"}`}>
+                <div className={`border-2 border-black rounded-lg p-3 ${showEmceeBase ? "" : "opacity-60"}`}>
                   <div className="text-sm font-semibold">Emcee</div>
                   <div className="mt-2 grid grid-cols-2 gap-2 items-center">
-                    <label className="text-xs text-gray-600">Senior (RM)</label>
+                    <label className="text-xs text-gray-700">Senior (RM)</label>
                     <input
                       disabled={!showEmceeBase}
-                      className="border rounded px-2 py-1 text-right disabled:opacity-60"
+                      className="border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400 disabled:opacity-60"
                       value={String((selection.baseRates as any)?.emceeSenior ?? base?.emceeSenior ?? "")}
                       onChange={(e) => setBaseRate("emceeSenior", e.target.value)}
                     />
-                    <label className="text-xs text-gray-600">Junior (RM)</label>
+                    <label className="text-xs text-gray-700">Junior (RM)</label>
                     <input
                       disabled={!showEmceeBase}
-                      className="border rounded px-2 py-1 text-right disabled:opacity-60"
+                      className="border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400 disabled:opacity-60"
                       value={String((selection.baseRates as any)?.emceeJunior ?? base?.emceeJunior ?? "")}
                       onChange={(e) => setBaseRate("emceeJunior", e.target.value)}
                     />
                   </div>
-                  {!showEmceeBase && <div className="text-xs text-gray-600 mt-2">Emcee base only applies for Half Day / Full Day.</div>}
+                  {!showEmceeBase && <div className="text-xs text-gray-700 mt-2">Emcee base only applies for Half Day / Full Day.</div>}
                 </div>
               </div>
             </div>
           )}
 
-          <div className="border rounded-xl p-3">
+          <div className="border-2 border-black rounded-xl p-3">
             <div className="text-sm font-semibold">Add-ons</div>
-            <div className="text-xs text-gray-600">Tick what applies, then adjust RM if needed.</div>
+            <div className="text-xs text-gray-700">Tick what applies, then adjust RM if needed.</div>
 
             <div className="mt-3 space-y-2">
               {addOnRows.map((row) => {
@@ -389,19 +423,19 @@ function TaskModal({
                     : add?.loadingUnloadingFlat);
 
                 return (
-                  <div key={row.code} className="border rounded-lg p-3 flex items-center justify-between gap-3">
-                    <label className="flex items-start gap-2 text-sm">
+                  <div key={row.code} className="border-2 border-black rounded-lg p-3 flex items-center justify-between gap-3 bg-white">
+                    <label className="flex items-start gap-2 text-sm text-gray-900">
                       <input type="checkbox" className="mt-1" checked={checked} onChange={() => toggleCode(row.code)} />
                       <div>
                         <div className="font-medium">{row.left}</div>
-                        <div className="text-xs text-gray-600">{row.unit === "perHour" ? "per hour" : "flat"}</div>
+                        <div className="text-xs text-gray-700">{row.unit === "perHour" ? "per hour" : "flat"}</div>
                       </div>
                     </label>
 
                     <div className="flex items-center gap-2">
-                      <span className="text-sm text-gray-600">RM</span>
+                      <span className="text-sm text-gray-700">RM</span>
                       <input
-                        className="w-24 border rounded px-2 py-1 text-right"
+                        className="w-24 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
                         value={String(current ?? "")}
                         onChange={(e) => setAddOnRate(String(row.rateKey), e.target.value)}
                       />
@@ -412,12 +446,12 @@ function TaskModal({
             </div>
           </div>
 
-          <div className="border rounded-xl p-3">
+          <div className="border-2 border-black rounded-xl p-3">
             <div className="text-sm font-semibold">Optional custom item</div>
-            <div className="text-xs text-gray-600">Example: “Driver fee”, “Special allowance”, etc.</div>
+            <div className="text-xs text-gray-700">Example: “Driver fee”, “Special allowance”, etc.</div>
 
             <div className="mt-3 flex flex-col md:flex-row gap-2 md:items-center">
-              <label className="flex items-center gap-2 text-sm">
+              <label className="flex items-center gap-2 text-sm text-gray-900">
                 <input
                   type="checkbox"
                   checked={!!selection.custom?.enabled}
@@ -436,7 +470,7 @@ function TaskModal({
               </label>
 
               <input
-                className="flex-1 border rounded px-2 py-1"
+                className="flex-1 border-2 border-black rounded px-2 py-1 bg-white text-gray-900 placeholder:text-gray-400"
                 placeholder="Optional text (e.g. Driver fee)"
                 value={selection.custom?.label || ""}
                 onChange={(e) =>
@@ -452,9 +486,9 @@ function TaskModal({
               />
 
               <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-600">RM</span>
+                <span className="text-sm text-gray-700">RM</span>
                 <input
-                  className="w-28 border rounded px-2 py-1 text-right"
+                  className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
                   placeholder="0"
                   value={String((selection.custom as any)?.amount ?? "")}
                   onChange={(e) =>
@@ -472,23 +506,25 @@ function TaskModal({
             </div>
           </div>
 
-          <div className="border rounded-xl p-3">
+          <div className="border-2 border-black rounded-xl p-3">
             <div className="text-sm font-semibold">Optional note</div>
             <input
-              className="mt-2 w-full border rounded px-2 py-2"
+              className="mt-2 w-full border-2 border-black rounded px-2 py-2 bg-white text-gray-900 placeholder:text-gray-400"
               placeholder="e.g. 'Backend include packing', etc"
               value={selection.note || ""}
               onChange={(e) => setSelection({ ...selection, note: e.target.value })}
             />
           </div>
 
-          <div className="text-xs text-gray-500">
+          <div className="text-xs text-gray-700">
             Tip: If you don’t want base claim, choose <b>None</b> and only tick add-ons.
           </div>
         </div>
 
-        <div className="sticky bottom-0 bg-white z-10 border-t p-4 flex justify-end">
-          <button className="px-4 py-2 border rounded" onClick={onClose}>Done</button>
+        <div className="sticky bottom-0 bg-white z-10 border-t-2 border-black p-4 flex justify-end">
+          <button className="px-4 py-2 border-2 border-black rounded bg-white text-gray-900" onClick={onClose}>
+            Done
+          </button>
         </div>
       </div>
     </div>
@@ -501,6 +537,9 @@ export default function ApprovedOTAdminPage() {
   const [users, setUsers] = useState<User[]>([]);
   const [events, setEvents] = useState<OtEvent[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
+
+  // export state
+  const [exportBusy, setExportBusy] = useState(false);
 
   // form
   const [date, setDate] = useState("");
@@ -643,7 +682,8 @@ export default function ApprovedOTAdminPage() {
       workRole: roleByUserId[id] || users.find((u) => u.id === id)?.defaultWorkRole || "JUNIOR_MARSHAL",
     }));
 
-    const url = editingEventId ? `/api/admin/ot-events/${editingEventId}` : "/api/admin/ot-events";
+    const url =
+      editingEventId ? `/api/admin/ot-events/${editingEventId}` : "/api/admin/ot-events";
     const method = editingEventId ? "PATCH" : "POST";
 
     const res = await fetch(url, {
@@ -714,17 +754,134 @@ export default function ApprovedOTAdminPage() {
     return parts.join(" · ");
   }, [selection]);
 
+  /* ---------------- Export existing approved OT to CSV ---------------- */
+  async function exportToCsv() {
+    try {
+      setExportBusy(true);
+      setMsg(null);
+
+      // Ensure latest data
+      const eRes = await fetch("/api/admin/ot-events");
+      const ej = await eRes.json().catch(() => ({}));
+
+      if (!eRes.ok) {
+        setMsg(ej?.error || "Export failed (cannot load events)");
+        return;
+      }
+
+      const evs: OtEvent[] = ej.events || [];
+
+      // One row per assignment
+      const headers = [
+        "EventDate",
+        "Project",
+        "StartTime",
+        "EndTime",
+        "Remark",
+        "UserName",
+        "UserEmail",
+        "WorkRole",
+        "TaskSummary",
+        "Breakdown",
+        "DefaultRM",
+        "OverrideRM",
+        "EffectiveRM",
+        "Status",
+        "EventId",
+        "AssignmentId",
+      ];
+
+      const rows: string[] = [];
+      rows.push(headers.map(csvEscape).join(","));
+
+      for (const ev of evs) {
+        const sel = safeParseSelection(ev.taskCodes || "{}");
+
+        const taskSummary = [
+          sel.claim ? CLAIM_LABEL[sel.claim] : "None",
+          sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
+          sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
+          sel.note ? `Note: ${sel.note}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+
+        const start = new Date(ev.startTime);
+        const end = new Date(ev.endTime);
+
+        for (const a of ev.assignments || []) {
+          const defaultCents = Number(a.amountDefault ?? 0);
+          const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
+          const effectiveCents = overrideCents ?? defaultCents;
+
+          const breakdown = buildTaskPayBreakdown({
+            workRole: a.workRole,
+            start,
+            end,
+            selection: sel,
+          });
+
+          const breakdownInline = formatBreakdownInline(breakdown.lines);
+
+          const line = [
+            toLocalDate(new Date(ev.date)),
+            ev.project || "",
+            toLocalTime(start),
+            toLocalTime(end),
+            ev.remark || "",
+            a.user?.name || "",
+            a.user?.email || "",
+            WORK_ROLE_LABEL[a.workRole] || a.workRole,
+            taskSummary,
+            breakdownInline,
+            centsToRm(defaultCents),
+            overrideCents === null ? "" : centsToRm(overrideCents),
+            centsToRm(effectiveCents),
+            a.status,
+            ev.id,
+            a.id,
+          ];
+
+          rows.push(line.map(csvEscape).join(","));
+        }
+      }
+
+      const csv = rows.join("\n");
+      const fileName = `approved-ot-export_${isoDateOnly(new Date())}.csv`;
+      downloadTextFile(fileName, csv);
+      setMsg("Exported CSV ✅");
+    } catch (e: any) {
+      setMsg(e?.message || "Export failed");
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-semibold">Admin — Approved OT</h1>
-      {msg && <div className="text-sm text-gray-700">{msg}</div>}
+    <div className="space-y-6 text-gray-900">
+      <div className="flex items-start justify-between gap-3 flex-col md:flex-row md:items-center">
+        <div>
+          <h1 className="text-2xl font-semibold">Admin — Approved OT</h1>
+          {msg && <div className="text-sm text-gray-900 mt-2">{msg}</div>}
+        </div>
+
+        <button
+          type="button"
+          onClick={exportToCsv}
+          disabled={exportBusy}
+          className="px-3 py-2 border-2 border-black rounded bg-white text-gray-900 hover:bg-gray-50 disabled:opacity-60"
+          title="Download as CSV (Excel/Google Sheets)"
+        >
+          {exportBusy ? "Exporting..." : "Export to CSV"}
+        </button>
+      </div>
 
       {/* Create / Edit form */}
-      <div className="bg-white border rounded-xl p-4">
+      <div className="bg-white border-2 border-black rounded-xl p-4">
         <div className="flex items-center justify-between mb-3">
           <div className="text-sm font-semibold">{editingEventId ? "Edit Approved OT" : "Create Approved OT"}</div>
           {editingEventId && (
-            <button className="text-sm px-3 py-1.5 border rounded" onClick={resetCreateForm}>
+            <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={resetCreateForm}>
               Cancel Edit
             </button>
           )}
@@ -734,38 +891,61 @@ export default function ApprovedOTAdminPage() {
           <div className="space-y-3">
             <div>
               <label className="text-sm font-semibold">Date</label>
-              <input className="w-full border rounded px-3 py-2" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+              <input
+                className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+              />
             </div>
 
             <div>
               <label className="text-sm font-semibold">Event / Project</label>
-              <input className="w-full border rounded px-3 py-2" value={project} onChange={(e) => setProject(e.target.value)} />
+              <input
+                className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
+                value={project}
+                onChange={(e) => setProject(e.target.value)}
+              />
             </div>
 
             <div>
               <label className="text-sm font-semibold">Task Description</label>
               <div className="flex gap-2">
-                <button type="button" className="px-3 py-2 border rounded" onClick={() => setModalOpen(true)}>
+                <button type="button" className="px-3 py-2 border-2 border-black rounded bg-white text-gray-900" onClick={() => setModalOpen(true)}>
                   Select tasks
                 </button>
               </div>
-              <div className="text-xs text-gray-600 mt-2">{selectionSummary}</div>
+              <div className="text-xs text-gray-700 mt-2">{selectionSummary}</div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-sm font-semibold">Start Time</label>
-                <input className="w-full border rounded px-3 py-2" type="time" value={startTime} onChange={(e) => setStartTime(e.target.value)} />
+                <input
+                  className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                  type="time"
+                  value={startTime}
+                  onChange={(e) => setStartTime(e.target.value)}
+                />
               </div>
               <div>
                 <label className="text-sm font-semibold">End Time</label>
-                <input className="w-full border rounded px-3 py-2" type="time" value={endTime} onChange={(e) => setEndTime(e.target.value)} />
+                <input
+                  className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                  type="time"
+                  value={endTime}
+                  onChange={(e) => setEndTime(e.target.value)}
+                />
               </div>
             </div>
 
             <div>
               <label className="text-sm font-semibold">Remark</label>
-              <input className="w-full border rounded px-3 py-2" value={remark} onChange={(e) => setRemark(e.target.value)} />
+              <input
+                className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
+                value={remark}
+                onChange={(e) => setRemark(e.target.value)}
+              />
             </div>
           </div>
 
@@ -773,19 +953,19 @@ export default function ApprovedOTAdminPage() {
           <div className="space-y-3">
             <div className="text-sm font-semibold">Marshal Approved (select users + role)</div>
 
-            <div className="max-h-56 overflow-auto border rounded p-2 bg-gray-50 space-y-2">
+            <div className="max-h-56 overflow-auto border-2 border-black rounded p-2 bg-gray-50 space-y-2">
               {users.map((u) => {
                 const checked = selectedUserIds.includes(u.id);
                 const currentRole = roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
                 return (
-                  <div key={u.id} className="flex items-center justify-between gap-2 bg-white border rounded px-2 py-2">
-                    <label className="flex items-center gap-2 text-sm">
+                  <div key={u.id} className="flex items-center justify-between gap-2 bg-white border-2 border-black rounded px-2 py-2">
+                    <label className="flex items-center gap-2 text-sm text-gray-900">
                       <input type="checkbox" checked={checked} onChange={() => toggleUser(u)} />
                       <span className="font-medium">{u.name}</span>
                     </label>
 
                     <select
-                      className="border rounded px-2 py-1 text-sm"
+                      className="border-2 border-black rounded px-2 py-1 text-sm bg-white text-gray-900"
                       disabled={!checked}
                       value={currentRole}
                       onChange={(e) => setRoleByUserId((prev) => ({ ...prev, [u.id]: e.target.value as WorkRole }))}
@@ -802,7 +982,7 @@ export default function ApprovedOTAdminPage() {
             </div>
 
             <div className="text-sm font-semibold">Pay Amount (default → editable)</div>
-            <div className="border rounded overflow-hidden">
+            <div className="border-2 border-black rounded overflow-hidden bg-white">
               <table className="w-full text-sm">
                 <thead className="bg-gray-50">
                   <tr>
@@ -815,12 +995,12 @@ export default function ApprovedOTAdminPage() {
                 <tbody>
                   {preview.map((p) => (
                     <tr key={p.user.id} className="border-t bg-white">
-                      <td className="p-2">{p.user.name}</td>
-                      <td className="p-2 text-xs text-gray-700">{WORK_ROLE_LABEL[p.workRole]}</td>
-                      <td className="p-2 text-right">{Number.isFinite(p.defaultRM) ? p.defaultRM.toFixed(2) : "0.00"}</td>
+                      <td className="p-2 text-gray-900">{p.user.name}</td>
+                      <td className="p-2 text-xs text-gray-900">{WORK_ROLE_LABEL[p.workRole]}</td>
+                      <td className="p-2 text-right text-gray-900">{Number.isFinite(p.defaultRM) ? p.defaultRM.toFixed(2) : "0.00"}</td>
                       <td className="p-2 text-right">
                         <input
-                          className="w-28 border rounded px-2 py-1 text-right"
+                          className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
                           placeholder="(auto)"
                           value={overrides[p.user.id] ?? ""}
                           onChange={(e) => setOverrides((prev) => ({ ...prev, [p.user.id]: e.target.value }))}
@@ -830,7 +1010,7 @@ export default function ApprovedOTAdminPage() {
                   ))}
                   {preview.length === 0 && (
                     <tr>
-                      <td className="p-3 text-gray-500" colSpan={4}>
+                      <td className="p-3 text-gray-700" colSpan={4}>
                         Select date + users to preview default pay
                       </td>
                     </tr>
@@ -839,7 +1019,7 @@ export default function ApprovedOTAdminPage() {
               </table>
             </div>
 
-            <button className="w-full rounded bg-black text-white py-2 hover:opacity-90" onClick={createOrUpdateEvent}>
+            <button className="w-full rounded bg-black text-white py-2 hover:opacity-90 border-2 border-black" onClick={createOrUpdateEvent}>
               {editingEventId ? "Save Changes" : "Create Approved OT"}
             </button>
           </div>
@@ -870,20 +1050,20 @@ export default function ApprovedOTAdminPage() {
             .join(" · ");
 
           return (
-            <div key={ev.id} className="bg-white border rounded-xl overflow-hidden">
-              <div className="p-4 border-b flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
-                <div>
+            <div key={ev.id} className="bg-white border-2 border-black rounded-xl overflow-hidden">
+              <div className="p-4 border-b-2 border-black flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                <div className="text-gray-900">
                   <div className="font-semibold">{titleLeft}</div>
-                  <div className="text-xs text-gray-600">{timeRange}</div>
-                  <div className="text-xs text-gray-700 mt-1">{selSummary}</div>
-                  {ev.remark && <div className="text-xs text-gray-600 mt-1">Remark: {ev.remark}</div>}
+                  <div className="text-xs text-gray-700">{timeRange}</div>
+                  <div className="text-xs text-gray-900 mt-1">{selSummary}</div>
+                  {ev.remark && <div className="text-xs text-gray-700 mt-1">Remark: {ev.remark}</div>}
                 </div>
 
                 <div className="flex gap-2">
-                  <button className="text-sm px-3 py-1.5 border rounded" onClick={() => fillFormFromEvent(ev)}>
+                  <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={() => fillFormFromEvent(ev)}>
                     Edit
                   </button>
-                  <button className="text-sm px-3 py-1.5 border rounded text-red-600 border-red-200" onClick={() => deleteEvent(ev.id)}>
+                  <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-red-600" onClick={() => deleteEvent(ev.id)}>
                     Delete
                   </button>
                 </div>
@@ -891,7 +1071,7 @@ export default function ApprovedOTAdminPage() {
 
               <div className="p-4">
                 <div className="text-sm font-semibold mb-2">Assignments</div>
-                <div className="border rounded overflow-hidden">
+                <div className="border-2 border-black rounded overflow-hidden bg-white">
                   <table className="w-full text-sm">
                     <thead className="bg-gray-50">
                       <tr>
@@ -920,19 +1100,19 @@ export default function ApprovedOTAdminPage() {
                         const inline = formatBreakdownInline(breakdown.lines);
 
                         return (
-                          <tr key={a.id} className={`border-t ${isPaid ? "bg-gray-100 text-gray-500" : "bg-white"}`}>
+                          <tr key={a.id} className={`border-t ${isPaid ? "bg-gray-100 text-gray-900" : "bg-white text-gray-900"}`}>
                             <td className="p-2">{a.user.name}</td>
                             <td className="p-2 text-xs">{WORK_ROLE_LABEL[a.workRole] || a.workRole}</td>
 
                             <td className="p-2 text-xs min-w-[280px]">
-                              <div className="text-gray-800">{inline}</div>
-                              <div className="text-[11px] text-gray-500 mt-1">Breakdown total: RM{breakdown.totalRM.toFixed(2)}</div>
+                              <div className="text-gray-900">{inline}</div>
+                              <div className="text-[11px] text-gray-700 mt-1">Breakdown total: RM{breakdown.totalRM.toFixed(2)}</div>
                             </td>
 
                             <td className="p-2 text-right">RM{centsToRm(defaultCents)}</td>
                             <td className="p-2 text-right">
                               <input
-                                className="w-28 border rounded px-2 py-1 text-right disabled:opacity-60"
+                                className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400 disabled:opacity-60"
                                 defaultValue={overrideCents !== null && Number.isFinite(overrideCents) ? (overrideCents / 100).toFixed(2) : ""}
                                 disabled={isPaid}
                                 placeholder="(none)"
@@ -957,7 +1137,7 @@ export default function ApprovedOTAdminPage() {
 
                       {ev.assignments.length === 0 && (
                         <tr>
-                          <td className="p-3 text-gray-500" colSpan={6}>
+                          <td className="p-3 text-gray-700" colSpan={6}>
                             No assignments
                           </td>
                         </tr>
@@ -970,12 +1150,11 @@ export default function ApprovedOTAdminPage() {
           );
         })}
 
-        {events.length === 0 && <div className="text-sm text-gray-600">No Approved OT yet.</div>}
+        {events.length === 0 && <div className="text-sm text-gray-700">No Approved OT yet.</div>}
       </div>
 
-      <div className="text-xs text-gray-500">
-        Note: For Edit/Delete to work, you must add API routes:
-        <code className="ml-1">/api/admin/ot-events/[id]</code> with PATCH + DELETE.
+      <div className="text-xs text-gray-700">
+        Note: For Edit/Delete to work, you must add API routes: <code className="ml-1">/api/admin/ot-events/[id]</code> with PATCH + DELETE.
       </div>
     </div>
   );
