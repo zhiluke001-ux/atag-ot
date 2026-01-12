@@ -911,7 +911,7 @@ if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
                       </tr>
                     </thead>
                     <tbody>
-                      {ev.assignments.map((a: any) => {
+                      {ev.assignments.map((a) => {
                         const isPaid = a.status === "PAID";
                         const defaultCents = Number(a.amountDefault ?? 0);
                         const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
