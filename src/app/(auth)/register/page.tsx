@@ -46,52 +46,71 @@ export default function RegisterPage() {
     }
   }
 
+  const inputClass =
+    "w-full rounded-lg border-2 border-black bg-white px-4 py-3 text-gray-900 " +
+    "placeholder:text-gray-500 placeholder:opacity-100 " +
+    "focus:outline-none focus:ring-0 focus:border-black " +
+    "disabled:opacity-60";
+
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
       <form
         onSubmit={onSubmit}
-        className="w-full max-w-sm bg-white p-6 rounded-xl shadow-sm border"
+        className="w-full max-w-sm bg-white p-6 rounded-2xl shadow-sm border-2 border-black"
       >
-        <h1 className="text-xl font-semibold">Register</h1>
-        <p className="text-sm text-gray-600 mt-1">Create your full-timer account</p>
+        <h1 className="text-2xl font-semibold text-gray-900">Register</h1>
+        <p className="text-sm text-gray-700 mt-1">Create your full-timer account</p>
 
-        <div className="mt-4 space-y-3">
+        <div className="mt-5 space-y-3">
           <input
-            className="w-full border rounded px-3 py-2"
+            className={inputClass}
             placeholder="Name"
+            autoComplete="name"
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
 
           <input
-            className="w-full border rounded px-3 py-2"
+            className={inputClass}
             placeholder="Email"
+            autoComplete="email"
+            inputMode="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
           />
 
           <input
-            className="w-full border rounded px-3 py-2"
+            className={inputClass}
             placeholder="Password (min 6 chars)"
             type="password"
+            autoComplete="new-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
 
-          {err && <div className="text-sm text-red-600">{err}</div>}
-          {msg && <div className="text-sm text-gray-700">{msg}</div>}
+          {err && (
+            <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              {err}
+            </div>
+          )}
+          {msg && (
+            <div className="text-sm text-gray-800 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+              {msg}
+            </div>
+          )}
 
           <button
+            type="submit"
             disabled={busy}
-            className="w-full rounded bg-black text-white py-2 hover:opacity-90 disabled:opacity-60"
+            className="w-full rounded-lg bg-black text-white py-3 font-medium hover:opacity-90 disabled:opacity-60"
           >
             {busy ? "Creating..." : "Create account"}
           </button>
         </div>
 
-        <div className="text-sm text-gray-600 mt-4">
+        <div className="text-sm text-gray-700 mt-4">
           Already have an account?{" "}
-          <Link className="underline" href="/login">
+          <Link className="underline text-gray-900" href="/login">
             Login
           </Link>
         </div>
