@@ -9,28 +9,9 @@ import type { TaskSelection, WorkRole, ClaimCode, TaskCode } from "@/lib/pricing
 export const runtime = "nodejs";
 
 /** ---------- validators ---------- */
-const WORK_ROLES: WorkRole[] = [
-  "JUNIOR_MARSHAL",
-  "SENIOR_MARSHAL",
-  "JUNIOR_EMCEE",
-  "SENIOR_EMCEE",
-];
-
-const CLAIMS: (ClaimCode | null)[] = [
-  null,
-  "EVENT_HOURLY",
-  "EVENT_HALF_DAY",
-  "EVENT_FULL_DAY",
-  "EVENT_2D1N",
-  "EVENT_3D2N",
-];
-
-const TASK_CODES: TaskCode[] = [
-  "BACKEND_RM15",
-  "EVENT_AFTER_6PM",
-  "EARLY_CALLING_RM30",
-  "LOADING_UNLOADING_RM30",
-];
+const WORK_ROLES: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCEE", "SENIOR_EMCEE"];
+const CLAIMS: (ClaimCode | null)[] = [null, "EVENT_HOURLY", "EVENT_HALF_DAY", "EVENT_FULL_DAY", "EVENT_2D1N", "EVENT_3D2N"];
+const TASK_CODES: TaskCode[] = ["BACKEND_RM15", "EVENT_AFTER_6PM", "EARLY_CALLING_RM30", "LOADING_UNLOADING_RM30"];
 
 function isWorkRole(x: any): x is WorkRole {
   return WORK_ROLES.includes(x);
@@ -54,7 +35,6 @@ function safeNumber(v: any): number | null {
 function parseDateInput(date: any): Date | null {
   if (typeof date !== "string") return null;
 
-  // yyyy-mm-dd (from <input type="date">)
   const iso = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (iso) {
     const d = new Date(`${iso[1]}-${iso[2]}-${iso[3]}T00:00:00`);
@@ -71,19 +51,17 @@ function toDate(x: any): Date | null {
 }
 
 /**
- * Your selection evolved (claim/codes/note/baseRates/addOnRates/custom).
- * We validate the important bits and keep the rest.
+ * Validate important bits only, keep the rest.
  */
 function parseSelection(input: any): TaskSelection | null {
   if (!input || typeof input !== "object") return null;
 
-  if (!isClaim(input.claim)) return null;
+  if (!isClaim(input.claim ?? null)) return null;
 
-  if (!Array.isArray(input.codes)) return null;
-  if (!input.codes.every(isTaskCode)) return null;
+  const codes = Array.isArray(input.codes) ? input.codes : [];
+  if (!codes.every(isTaskCode)) return null;
 
-  // allow extra keys
-  return input as TaskSelection;
+  return { ...input, claim: input.claim ?? null, codes } as TaskSelection;
 }
 
 async function requireAdmin() {
@@ -125,16 +103,19 @@ export async function POST(req: Request) {
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
   try {
-    const adminId = (session.user as any)?.id as string | undefined;
+    // robust adminId: session.user.id else fallback by email
+    let adminId = (session.user as any)?.id as string | undefined;
     if (!adminId) {
-      return NextResponse.json(
-        { error: "Missing user.id in session (ensure NextAuth session includes id)" },
-        { status: 400 }
-      );
+      const email = session.user?.email;
+      if (!email) return NextResponse.json({ error: "Missing session user email" }, { status: 400 });
+      const admin = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+      adminId = admin?.id;
+    }
+    if (!adminId) {
+      return NextResponse.json({ error: "Missing adminId (ensure NextAuth session includes user.id)" }, { status: 400 });
     }
 
     const body = await req.json().catch(() => null);
-
     const {
       date,
       project,
@@ -144,11 +125,9 @@ export async function POST(req: Request) {
       remark,
       selection,
       overrides,
-      // NEW (your UI)
-      assignments,
-      // OLD (compat)
-      userIds,
-      workRoles,
+      assignments, // NEW UI
+      userIds, // compat
+      workRoles, // compat
     } = body || {};
 
     if (!date || !project || !startTime || !endTime) {
@@ -165,19 +144,12 @@ export async function POST(req: Request) {
     const sel = parseSelection(selection);
     if (!sel) return NextResponse.json({ error: "Invalid selection" }, { status: 400 });
 
-    // ✅ Normalize assignment inputs
+    // normalize assignments
     let normalized: { userId: string; workRole: WorkRole }[] = [];
-
     if (Array.isArray(assignments) && assignments.length > 0) {
-      normalized = assignments.map((a: any) => ({
-        userId: String(a?.userId || ""),
-        workRole: a?.workRole,
-      }));
+      normalized = assignments.map((a: any) => ({ userId: String(a?.userId || ""), workRole: a?.workRole }));
     } else if (Array.isArray(userIds) && userIds.length > 0) {
-      normalized = userIds.map((id: any) => ({
-        userId: String(id),
-        workRole: workRoles?.[id],
-      }));
+      normalized = userIds.map((id: any) => ({ userId: String(id), workRole: workRoles?.[id] }));
     } else {
       return NextResponse.json({ error: "No users selected" }, { status: 400 });
     }
@@ -191,9 +163,7 @@ export async function POST(req: Request) {
       return true;
     });
 
-    // validate roles (fallback later)
     const ids = normalized.map((a) => a.userId);
-
     const users = await prisma.user.findMany({
       where: { id: { in: ids } },
       select: { id: true, active: true, defaultWorkRole: true },
@@ -201,9 +171,7 @@ export async function POST(req: Request) {
 
     const found = new Map(users.map((u) => [u.id, u]));
     const missing = ids.filter((id) => !found.has(id));
-    if (missing.length) {
-      return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
-    }
+    if (missing.length) return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
 
     const created = await prisma.otEvent.create({
       data: {
@@ -245,7 +213,6 @@ export async function POST(req: Request) {
       .filter(Boolean) as any[];
 
     if (assignmentsData.length === 0) {
-      // rollback event if no active assignments
       await prisma.otEvent.delete({ where: { id: created.id } });
       return NextResponse.json({ error: "No active users to assign" }, { status: 400 });
     }
@@ -254,7 +221,6 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ ok: true, id: created.id });
   } catch (e: any) {
-    const msg = typeof e?.message === "string" ? e.message : "Internal error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return NextResponse.json({ error: e?.message || "Internal error" }, { status: 500 });
   }
 }
