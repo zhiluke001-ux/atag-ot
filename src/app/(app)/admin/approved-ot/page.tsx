@@ -713,7 +713,9 @@ export default function ApprovedOTAdminPage() {
   const selectionSummary = useMemo(() => {
     const parts: string[] = [];
     parts.push(selection.claim ? CLAIM_LABEL[selection.claim] : "None");
-    if (selection.codes.length) parts.push(selection.codes.map((c: any) => TASK_LABEL[c]).join(" + "));
+    const codes = (selection.codes ?? []) as TaskCode[];
+if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
+
     if (selection.custom?.enabled && selection.custom.amount) parts.push(`Custom: ${selection.custom.label || "Item"} (RM${selection.custom.amount})`);
     if (selection.note) parts.push(`Note: ${selection.note}`);
     return parts.join(" · ");
