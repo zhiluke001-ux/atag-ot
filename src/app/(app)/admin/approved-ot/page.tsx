@@ -37,10 +37,10 @@ type Assignment = {
 
 type OtEvent = {
   id: string;
-  date: string;
+  date: string; // start date (kept for backward compatibility)
   project: string;
-  startTime: string;
-  endTime: string;
+  startTime: string; // ISO
+  endTime: string; // ISO (can be next day / multi-day)
   taskCodes: string;
   remark: string | null;
   assignments: Assignment[];
@@ -57,6 +57,13 @@ function isoDateOnly(d: Date) {
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function addDaysToIsoDate(iso: string, days: number) {
+  if (!iso) return "";
+  const d = new Date(`${iso}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return isoDateOnly(d);
 }
 
 function hhmmFromIso(iso: string) {
@@ -223,7 +230,6 @@ function toLocalTime(d: Date) {
 
 function csvEscape(v: unknown) {
   const s = String(v ?? "");
-  // if contains comma, quote or newline -> wrap in quotes and escape quotes
   if (/[,"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
@@ -541,15 +547,21 @@ export default function ApprovedOTAdminPage() {
   // export state
   const [exportBusy, setExportBusy] = useState(false);
 
-  // form
-  const [date, setDate] = useState("");
+  // form (order: Project -> Task -> Date(s))
   const [project, setProject] = useState("");
+  const [modalOpen, setModalOpen] = useState(false);
+
+  // dates
+  const [date, setDate] = useState(""); // start date (YYYY-MM-DD)
+  const [endDate, setEndDate] = useState(""); // end date for 2D1N / 3D2N (YYYY-MM-DD)
+
+  // time
   const [startTime, setStartTime] = useState("18:00");
   const [endTime, setEndTime] = useState("20:00");
+
   const [remark, setRemark] = useState("");
 
-  // modal + selection
-  const [modalOpen, setModalOpen] = useState(false);
+  // selection
   const [selection, setSelection] = useState<TaskSelection>({
     claim: null,
     codes: [],
@@ -559,31 +571,53 @@ export default function ApprovedOTAdminPage() {
     custom: { enabled: false, label: "", amount: "" } as any,
   } as TaskSelection);
 
+  const isMultiDay = selection.claim === "EVENT_2D1N" || selection.claim === "EVENT_3D2N";
+
   // chosen users + role per user + overrides
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [roleByUserId, setRoleByUserId] = useState<Record<string, WorkRole>>({});
   const [overrides, setOverrides] = useState<Record<string, string>>({}); // RM as string
 
-  // Edit mode for existing event
+  // Edit mode
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
 
   function combineDateTime(d: string, t: string) {
     return new Date(`${d}T${t}:00`);
   }
 
+  // auto-set endDate when switching claim to 2D1N/3D2N
+  useEffect(() => {
+    if (!date) return;
+
+    if (isMultiDay) {
+      if (!endDate || endDate === date) {
+        const delta = selection.claim === "EVENT_3D2N" ? 2 : 1;
+        setEndDate(addDaysToIsoDate(date, delta));
+      }
+    } else {
+      // keep endDate in sync for normal events
+      if (endDate !== date) setEndDate(date);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selection.claim, date]);
+
   const selectedUsers = useMemo(() => users.filter((u) => selectedUserIds.includes(u.id)), [users, selectedUserIds]);
 
   const preview = useMemo(() => {
     if (!date) return [];
+
+    const endDateUsed = isMultiDay ? endDate : date;
+    if (isMultiDay && !endDateUsed) return [];
+
     const start = combineDateTime(date, startTime);
-    const end = combineDateTime(date, endTime);
+    const end = combineDateTime(endDateUsed, endTime);
 
     return selectedUsers.map((u) => {
       const workRole = roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
       const rm = computeDefaultPayRM({ workRole, start, end, selection });
       return { user: u, workRole, defaultRM: rm };
     });
-  }, [selectedUsers, roleByUserId, selection, date, startTime, endTime]);
+  }, [selectedUsers, roleByUserId, selection, date, endDate, startTime, endTime, isMultiDay]);
 
   async function loadAll() {
     setMsg(null);
@@ -620,11 +654,14 @@ export default function ApprovedOTAdminPage() {
 
   function resetCreateForm() {
     setEditingEventId(null);
-    setDate("");
+
     setProject("");
+    setDate("");
+    setEndDate("");
     setStartTime("18:00");
     setEndTime("20:00");
     setRemark("");
+
     setSelection({
       claim: null,
       codes: [],
@@ -633,17 +670,21 @@ export default function ApprovedOTAdminPage() {
       addOnRates: {},
       custom: { enabled: false, label: "", amount: "" } as any,
     } as TaskSelection);
+
     setSelectedUserIds([]);
     setRoleByUserId({});
     setOverrides({});
   }
 
   function fillFormFromEvent(ev: OtEvent) {
-    const d = new Date(ev.date);
     setEditingEventId(ev.id);
 
-    setDate(isoDateOnly(d));
+    const s = new Date(ev.startTime);
+    const e = new Date(ev.endTime);
+
     setProject(ev.project || "");
+    setDate(isoDateOnly(s));
+    setEndDate(isoDateOnly(e));
     setStartTime(hhmmFromIso(ev.startTime));
     setEndTime(hhmmFromIso(ev.endTime));
     setRemark(ev.remark || "");
@@ -669,28 +710,35 @@ export default function ApprovedOTAdminPage() {
 
   async function createOrUpdateEvent() {
     setMsg(null);
-    if (!date || !project || selectedUserIds.length === 0) {
-      setMsg("Please fill date/project and select users.");
+
+    const endDateUsed = isMultiDay ? endDate : date;
+
+    if (!project || !date || (isMultiDay && !endDateUsed) || selectedUserIds.length === 0) {
+      setMsg(isMultiDay ? "Please fill project + start date + end date and select users." : "Please fill project + date and select users.");
+      return;
+    }
+
+    if (endDateUsed < date) {
+      setMsg("End date cannot be earlier than start date.");
       return;
     }
 
     const start = combineDateTime(date, startTime);
-    const end = combineDateTime(date, endTime);
+    const end = combineDateTime(endDateUsed, endTime);
 
     const assignments = selectedUserIds.map((id) => ({
       userId: id,
       workRole: roleByUserId[id] || users.find((u) => u.id === id)?.defaultWorkRole || "JUNIOR_MARSHAL",
     }));
 
-    const url =
-      editingEventId ? `/api/admin/ot-events/${editingEventId}` : "/api/admin/ot-events";
+    const url = editingEventId ? `/api/admin/ot-events/${editingEventId}` : "/api/admin/ot-events";
     const method = editingEventId ? "PATCH" : "POST";
 
     const res = await fetch(url, {
       method,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        date,
+        date, // keep start date in DB field
         project,
         startTime: start.toISOString(),
         endTime: end.toISOString(),
@@ -760,7 +808,6 @@ export default function ApprovedOTAdminPage() {
       setExportBusy(true);
       setMsg(null);
 
-      // Ensure latest data
       const eRes = await fetch("/api/admin/ot-events");
       const ej = await eRes.json().catch(() => ({}));
 
@@ -771,9 +818,9 @@ export default function ApprovedOTAdminPage() {
 
       const evs: OtEvent[] = ej.events || [];
 
-      // One row per assignment
       const headers = [
-        "EventDate",
+        "StartDate",
+        "EndDate",
         "Project",
         "StartTime",
         "EndTime",
@@ -809,6 +856,9 @@ export default function ApprovedOTAdminPage() {
         const start = new Date(ev.startTime);
         const end = new Date(ev.endTime);
 
+        const startDateLabel = isoDateOnly(start);
+        const endDateLabel = isoDateOnly(end);
+
         for (const a of ev.assignments || []) {
           const defaultCents = Number(a.amountDefault ?? 0);
           const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
@@ -824,7 +874,8 @@ export default function ApprovedOTAdminPage() {
           const breakdownInline = formatBreakdownInline(breakdown.lines);
 
           const line = [
-            toLocalDate(new Date(ev.date)),
+            startDateLabel,
+            endDateLabel,
             ev.project || "",
             toLocalTime(start),
             toLocalTime(end),
@@ -889,16 +940,7 @@ export default function ApprovedOTAdminPage() {
 
         <div className="grid md:grid-cols-2 gap-4">
           <div className="space-y-3">
-            <div>
-              <label className="text-sm font-semibold">Date</label>
-              <input
-                className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-              />
-            </div>
-
+            {/* 1) Event / Project FIRST */}
             <div>
               <label className="text-sm font-semibold">Event / Project</label>
               <input
@@ -908,16 +950,60 @@ export default function ApprovedOTAdminPage() {
               />
             </div>
 
+            {/* 2) Task Description SECOND */}
             <div>
               <label className="text-sm font-semibold">Task Description</label>
               <div className="flex gap-2">
-                <button type="button" className="px-3 py-2 border-2 border-black rounded bg-white text-gray-900" onClick={() => setModalOpen(true)}>
+                <button
+                  type="button"
+                  className="px-3 py-2 border-2 border-black rounded bg-white text-gray-900"
+                  onClick={() => setModalOpen(true)}
+                >
                   Select tasks
                 </button>
               </div>
               <div className="text-xs text-gray-700 mt-2">{selectionSummary}</div>
             </div>
 
+            {/* 3) Date(s) THIRD */}
+            {!isMultiDay ? (
+              <div>
+                <label className="text-sm font-semibold">Date</label>
+                <input
+                  className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                  type="date"
+                  value={date}
+                  onChange={(e) => setDate(e.target.value)}
+                />
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-sm font-semibold">Start Date</label>
+                  <input
+                    className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                    type="date"
+                    value={date}
+                    onChange={(e) => setDate(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm font-semibold">End Date</label>
+                  <input
+                    className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                    type="date"
+                    value={endDate}
+                    min={date || undefined}
+                    onChange={(e) => setEndDate(e.target.value)}
+                  />
+                </div>
+                <div className="md:col-span-2 text-xs text-gray-700">
+                  For <b>2D1N</b> / <b>3D2N</b>, pick both start & end dates.
+                </div>
+              </div>
+            )}
+
+            {/* time */}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-sm font-semibold">Start Time</label>
@@ -1011,7 +1097,7 @@ export default function ApprovedOTAdminPage() {
                   {preview.length === 0 && (
                     <tr>
                       <td className="p-3 text-gray-700" colSpan={4}>
-                        Select date + users to preview default pay
+                        Select task + date(s) + users to preview default pay
                       </td>
                     </tr>
                   )}
@@ -1035,10 +1121,18 @@ export default function ApprovedOTAdminPage() {
         {events.map((ev) => {
           const sel = safeParseSelection(ev.taskCodes || "{}");
 
-          const titleLeft = `${new Date(ev.date).toLocaleDateString()} — ${ev.project}`;
-          const timeRange =
-            `${new Date(ev.startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} - ` +
-            `${new Date(ev.endTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+          const s = new Date(ev.startTime);
+          const e = new Date(ev.endTime);
+          const startDateLabel = s.toLocaleDateString();
+          const endDateLabel = e.toLocaleDateString();
+          const sameDay = startDateLabel === endDateLabel;
+
+          const dateLabel = sameDay ? startDateLabel : `${startDateLabel} → ${endDateLabel}`;
+          const titleLeft = `${dateLabel} — ${ev.project}`;
+
+          const timeRange = sameDay
+            ? `${toLocalTime(s)} - ${toLocalTime(e)}`
+            : `${startDateLabel} ${toLocalTime(s)} - ${endDateLabel} ${toLocalTime(e)}`;
 
           const selSummary = [
             sel.claim ? CLAIM_LABEL[sel.claim] : "None",
@@ -1092,8 +1186,8 @@ export default function ApprovedOTAdminPage() {
 
                         const breakdown = buildTaskPayBreakdown({
                           workRole: a.workRole,
-                          start: new Date(ev.startTime),
-                          end: new Date(ev.endTime),
+                          start: s,
+                          end: e,
                           selection: sel,
                         });
 
