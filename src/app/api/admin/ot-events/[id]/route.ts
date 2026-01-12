@@ -9,9 +9,26 @@ import type { TaskSelection, WorkRole, ClaimCode, TaskCode } from "@/lib/pricing
 export const runtime = "nodejs";
 
 /** ---------- validators ---------- */
-const WORK_ROLES: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCEE", "SENIOR_EMCEE"];
-const CLAIMS: (ClaimCode | null)[] = [null, "EVENT_HOURLY", "EVENT_HALF_DAY", "EVENT_FULL_DAY", "EVENT_2D1N", "EVENT_3D2N"];
-const TASK_CODES: TaskCode[] = ["BACKEND_RM15", "EVENT_AFTER_6PM", "EARLY_CALLING_RM30", "LOADING_UNLOADING_RM30"];
+const WORK_ROLES: WorkRole[] = [
+  "JUNIOR_MARSHAL",
+  "SENIOR_MARSHAL",
+  "JUNIOR_EMCEE",
+  "SENIOR_EMCEE",
+];
+const CLAIMS: (ClaimCode | null)[] = [
+  null,
+  "EVENT_HOURLY",
+  "EVENT_HALF_DAY",
+  "EVENT_FULL_DAY",
+  "EVENT_2D1N",
+  "EVENT_3D2N",
+];
+const TASK_CODES: TaskCode[] = [
+  "BACKEND_RM15",
+  "EVENT_AFTER_6PM",
+  "EARLY_CALLING_RM30",
+  "LOADING_UNLOADING_RM30",
+];
 
 function isWorkRole(x: any): x is WorkRole {
   return WORK_ROLES.includes(x);
@@ -69,10 +86,10 @@ async function requireAdmin() {
   return session;
 }
 
-function getId(params: any): string | null {
-  const id = params?.id;
-  if (typeof id !== "string" || !id.trim()) return null;
-  return id;
+function normalizeId(id: unknown): string | null {
+  if (typeof id !== "string") return null;
+  const v = id.trim();
+  return v ? v : null;
 }
 
 /**
@@ -189,11 +206,15 @@ async function recomputeAllAssignmentsForEvent(args: {
 }
 
 /** ---------- handlers ---------- */
-export async function PATCH(req: Request, ctx: { params: { id: string } }) {
+export async function PATCH(
+  req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
-  const id = getId(ctx?.params);
+  const { id: rawId } = await params;
+  const id = normalizeId(rawId);
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
@@ -211,7 +232,10 @@ export async function PATCH(req: Request, ctx: { params: { id: string } }) {
     } = body || {};
 
     // load existing event to allow partial updates
-    const existing = await prisma.otEvent.findUnique({ where: { id }, select: { id: true, date: true, startTime: true, endTime: true, taskCodes: true } });
+    const existing = await prisma.otEvent.findUnique({
+      where: { id },
+      select: { id: true, date: true, startTime: true, endTime: true, taskCodes: true },
+    });
     if (!existing) return NextResponse.json({ error: "Event not found" }, { status: 404 });
 
     // determine next values (partial update supported)
@@ -220,9 +244,20 @@ export async function PATCH(req: Request, ctx: { params: { id: string } }) {
 
     const nextStart = startTime ? toDate(startTime) : existing.startTime;
     const nextEnd = endTime ? toDate(endTime) : existing.endTime;
-    if (!nextStart || !nextEnd) return NextResponse.json({ error: "Invalid startTime/endTime" }, { status: 400 });
+    if (!nextStart || !nextEnd)
+      return NextResponse.json({ error: "Invalid startTime/endTime" }, { status: 400 });
 
-    const selObj = selection ? parseSelection(selection) : parseSelection(JSON.parse(existing.taskCodes || "{}"));
+    // selection: prefer body.selection, else parse existing.taskCodes
+    let selObj: TaskSelection | null = null;
+    if (selection) {
+      selObj = parseSelection(selection);
+    } else {
+      try {
+        selObj = parseSelection(JSON.parse(existing.taskCodes || "{}"));
+      } catch {
+        selObj = null;
+      }
+    }
     if (!selObj) return NextResponse.json({ error: "Invalid selection" }, { status: 400 });
 
     // update event
@@ -259,11 +294,15 @@ export async function PATCH(req: Request, ctx: { params: { id: string } }) {
   }
 }
 
-export async function DELETE(_req: Request, ctx: { params: { id: string } }) {
+export async function DELETE(
+  _req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
-  const id = getId(ctx?.params);
+  const { id: rawId } = await params;
+  const id = normalizeId(rawId);
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
