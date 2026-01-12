@@ -23,7 +23,6 @@ export default function LoginPage() {
         callbackUrl: "/rates",
       });
 
-      // If redirect true, errors can still be returned in some cases
       if ((res as any)?.error) setErr("Invalid login");
     } finally {
       setLoading(false);
@@ -31,9 +30,9 @@ export default function LoginPage() {
   }
 
   const inputClass =
-    "w-full rounded-lg border border-gray-300 bg-white px-4 py-3 text-gray-900 " +
+    "w-full rounded-lg border-2 border-black bg-white px-4 py-3 text-gray-900 " +
     "placeholder:text-gray-500 placeholder:opacity-100 " +
-    "focus:outline-none focus:ring-2 focus:ring-black/20 focus:border-gray-400 " +
+    "focus:outline-none focus:ring-0 focus:border-black " +
     "disabled:opacity-60";
 
   return (
