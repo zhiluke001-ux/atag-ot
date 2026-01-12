@@ -399,32 +399,31 @@ export default function MyPayPage() {
     }
   }
 
-  async function detectAndLoad() {
-    setLoading(true);
-    setMsg(null);
+async function detectAndLoad() {
+  setMsg(null);
 
-    try {
-      // try admin endpoint; if forbidden => normal user
-      const uRes = await fetch("/api/admin/users", { cache: "no-store" });
-      if (uRes.ok) {
-        setIsAdmin(true);
+  try {
+    // ✅ Use a non-admin endpoint to check role
+    const meRes = await fetch("/api/me/profile", { cache: "no-store" });
+    const me = await meRes.json().catch(() => ({}));
 
-        const uj = await uRes.json().catch(() => ({}));
-        const users: AdminUser[] = Array.isArray(uj.users) ? uj.users : [];
-        setAdminUsers(users);
+    const role = me?.user?.role;
 
-        const defaultId = users?.[0]?.id || "";
-        setSelectedUserId(defaultId);
+    if (meRes.ok && role === "ADMIN") {
+      setIsAdmin(true);
+      await loadAdminUsersAndEvents(); // calls /api/admin/users + /api/admin/ot-events (now only for admin)
+      return;
+    }
 
-        const eRes = await fetch("/api/admin/ot-events", { cache: "no-store" });
-        const ej = await eRes.json().catch(() => ({}));
-        if (!eRes.ok) {
-          setMsg(ej?.error || "Failed to load OT events");
-          setAdminEvents([]);
-          setRows([]);
-          setLoading(false);
-          return;
-        }
+    // normal user
+    setIsAdmin(false);
+    await loadNormal();
+  } catch (e: any) {
+    setIsAdmin(false);
+    await loadNormal();
+  }
+}
+
 
         const events: AdminOtEvent[] = Array.isArray(ej.events) ? ej.events : [];
         setAdminEvents(events);
