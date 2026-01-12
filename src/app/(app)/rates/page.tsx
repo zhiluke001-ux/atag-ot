@@ -35,13 +35,13 @@ export default function RatesPage() {
               <b>Backend:</b> RM15 per hour (Annual Dinner / Karaoke / Packing / Set Up)
             </p>
             <p>
-              <b>Event (starts after 6PM):</b> Senior RM30/hr, Junior RM20/hr (e.g. 7PM–9PM)
+              <b>Event starts after 6PM (RM30 | RM20 per hour)
             </p>
             <p>
-              <b>Early Calling:</b> RM30 (flat)
+              <b>Early Calling:</b> RM30 
             </p>
             <p>
-              <b>Loading &amp; Unloading:</b> RM30 (flat)
+              <b>Loading &amp; Unloading:</b> RM30 
             </p>
           </div>
         </div>
