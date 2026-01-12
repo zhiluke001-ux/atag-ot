@@ -39,7 +39,7 @@ export default function LoginPage() {
     <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
       <form
         onSubmit={onSubmit}
-        className="w-full max-w-sm bg-white p-6 rounded-2xl shadow-sm border border-gray-200"
+        className="w-full max-w-sm bg-white p-6 rounded-2xl shadow-sm border-2 border-black"
       >
         <h1 className="text-2xl font-semibold text-gray-900">Login</h1>
         <p className="text-sm text-gray-700 mt-1">Full-timer OT system</p>
@@ -64,7 +64,7 @@ export default function LoginPage() {
           />
 
           {err && (
-            <div className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+            <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
               {err}
             </div>
           )}
