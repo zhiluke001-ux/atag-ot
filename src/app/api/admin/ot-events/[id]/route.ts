@@ -1,4 +1,4 @@
-// src/app/api/admin/ot-events/route.ts
+// src/app/api/admin/ot-events/[id]/route.ts
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
@@ -10,9 +10,7 @@ export const runtime = "nodejs";
 
 /** ---------- validators ---------- */
 const WORK_ROLES: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCEE", "SENIOR_EMCEE"];
-
 const CLAIMS: (ClaimCode | null)[] = [null, "EVENT_HOURLY", "EVENT_HALF_DAY", "EVENT_FULL_DAY", "EVENT_2D1N", "EVENT_3D2N"];
-
 const TASK_CODES: TaskCode[] = ["BACKEND_RM15", "EVENT_AFTER_6PM", "EARLY_CALLING_RM30", "LOADING_UNLOADING_RM30"];
 
 function isWorkRole(x: any): x is WorkRole {
@@ -36,13 +34,11 @@ function safeNumber(v: any): number | null {
 
 function parseDateInput(date: any): Date | null {
   if (typeof date !== "string") return null;
-
   const iso = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (iso) {
     const d = new Date(`${iso[1]}-${iso[2]}-${iso[3]}T00:00:00`);
     return Number.isNaN(d.getTime()) ? null : d;
   }
-
   const d = new Date(date);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -54,7 +50,6 @@ function toDate(x: any): Date | null {
 
 /**
  * Validate important bits only, keep the rest.
- * Also make it tolerant if claim/codes are missing.
  */
 function parseSelection(input: any): TaskSelection | null {
   if (!input || typeof input !== "object") return null;
@@ -74,60 +69,135 @@ async function requireAdmin() {
   return session;
 }
 
-/** ---------- handlers ---------- */
-export async function GET() {
-  const session = await requireAdmin();
-  if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-
-  const events = await prisma.otEvent.findMany({
-    orderBy: { date: "desc" },
-    include: {
-      assignments: {
-        select: {
-          id: true,
-          userId: true,
-          workRole: true,
-          status: true,
-          amountDefault: true,
-          amountOverride: true,
-          paidAt: true,
-          paidById: true,
-          user: { select: { name: true, email: true } },
-        },
-        orderBy: { user: { name: "asc" } },
-      },
-    },
-  });
-
-  return NextResponse.json({ events });
+function getId(params: any): string | null {
+  const id = params?.id;
+  if (typeof id !== "string" || !id.trim()) return null;
+  return id;
 }
 
-export async function POST(req: Request) {
+/**
+ * Recompute assignment amountDefault for a given event time/selection/role.
+ * Note: status/paidAt not touched here.
+ */
+async function recomputeAllAssignmentsForEvent(args: {
+  eventId: string;
+  start: Date;
+  end: Date;
+  selection: TaskSelection;
+  overrides?: Record<string, any> | null;
+  assignments?: { userId: string; workRole: WorkRole }[] | null;
+}) {
+  const { eventId, start, end, selection, overrides, assignments } = args;
+
+  // Load existing
+  const existing = await prisma.otAssignment.findMany({
+    where: { otEventId: eventId },
+    select: { id: true, userId: true, workRole: true, status: true, amountOverride: true },
+  });
+
+  // If UI passed assignments list: sync membership + role
+  // Otherwise keep existing membership/roles and only recompute by their current role.
+  const syncList = Array.isArray(assignments) ? assignments : null;
+
+  if (syncList) {
+    // de-dup by userId
+    const seen = new Set<string>();
+    const normalized = syncList
+      .map((a) => ({ userId: String((a as any)?.userId || ""), workRole: (a as any)?.workRole }))
+      .filter((a) => a.userId && !seen.has(a.userId) && (seen.add(a.userId), true));
+
+    // validate + fetch users for defaults
+    const ids = normalized.map((x) => x.userId);
+    const users = await prisma.user.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, active: true, defaultWorkRole: true },
+    });
+    const found = new Map(users.map((u) => [u.id, u]));
+    const missing = ids.filter((id) => !found.has(id));
+    if (missing.length) throw new Error(`Unknown userIds: ${missing.join(", ")}`);
+
+    // delete assignments removed from list
+    const keepIds = new Set(ids);
+    const toDelete = existing.filter((a) => !keepIds.has(a.userId)).map((a) => a.id);
+    if (toDelete.length) {
+      await prisma.otAssignment.deleteMany({ where: { id: { in: toDelete } } });
+    }
+
+    // upsert each selected user assignment
+    for (const x of normalized) {
+      const u = found.get(x.userId)!;
+      if (!u.active) continue;
+
+      const rolePicked = isWorkRole(x.workRole) ? x.workRole : u.defaultWorkRole;
+      if (!isWorkRole(rolePicked)) continue;
+
+      const defaultRM = computeDefaultPayRM({ workRole: rolePicked, start, end, selection });
+      const amountDefault = rmToCents(defaultRM);
+
+      const raw = overrides?.[x.userId];
+      const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
+      const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
+
+      const existRow = existing.find((a) => a.userId === x.userId);
+      if (!existRow) {
+        await prisma.otAssignment.create({
+          data: {
+            otEventId: eventId,
+            userId: x.userId,
+            workRole: rolePicked,
+            amountDefault,
+            amountOverride,
+          },
+        });
+      } else {
+        // keep PAID/UNPAID status as-is, only adjust role + default + override
+        await prisma.otAssignment.update({
+          where: { id: existRow.id },
+          data: {
+            workRole: rolePicked,
+            amountDefault,
+            amountOverride,
+          },
+        });
+      }
+    }
+
+    return;
+  }
+
+  // No syncList: just recompute amountDefault for existing assignments (role stays same).
+  for (const a of existing) {
+    const rolePicked = a.workRole;
+    if (!isWorkRole(rolePicked)) continue;
+
+    const defaultRM = computeDefaultPayRM({ workRole: rolePicked, start, end, selection });
+    const amountDefault = rmToCents(defaultRM);
+
+    // allow updating overrides by userId if passed
+    let amountOverride: number | null = a.amountOverride ?? null;
+    if (overrides && Object.prototype.hasOwnProperty.call(overrides, a.userId)) {
+      const raw = overrides?.[a.userId];
+      const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
+      amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
+    }
+
+    await prisma.otAssignment.update({
+      where: { id: a.id },
+      data: { amountDefault, amountOverride },
+    });
+  }
+}
+
+/** ---------- handlers ---------- */
+export async function PATCH(req: Request, ctx: { params: { id: string } }) {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
+  const id = getId(ctx?.params);
+  if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+
   try {
-    // ✅ Robust adminId: use session.user.id, else fallback to DB lookup by email
-    let adminId = (session.user as any)?.id as string | undefined;
-
-    if (!adminId) {
-      const email = session.user?.email;
-      if (!email) {
-        return NextResponse.json({ error: "Missing session user email" }, { status: 400 });
-      }
-      const admin = await prisma.user.findUnique({ where: { email }, select: { id: true } });
-      adminId = admin?.id;
-    }
-
-    if (!adminId) {
-      return NextResponse.json(
-        { error: "Missing adminId (fix NextAuth session callback to include user.id)" },
-        { status: 400 }
-      );
-    }
-
     const body = await req.json().catch(() => null);
-
     const {
       date,
       project,
@@ -137,115 +207,76 @@ export async function POST(req: Request) {
       remark,
       selection,
       overrides,
-      // NEW (your UI)
-      assignments,
-      // OLD (compat)
-      userIds,
-      workRoles,
+      assignments, // optional: allow syncing membership/roles
     } = body || {};
 
-    if (!date || !project || !startTime || !endTime) {
-      return NextResponse.json({ error: "Missing fields" }, { status: 400 });
-    }
+    // load existing event to allow partial updates
+    const existing = await prisma.otEvent.findUnique({ where: { id }, select: { id: true, date: true, startTime: true, endTime: true, taskCodes: true } });
+    if (!existing) return NextResponse.json({ error: "Event not found" }, { status: 404 });
 
-    const eventDate = parseDateInput(date);
-    if (!eventDate) return NextResponse.json({ error: "Invalid date" }, { status: 400 });
+    // determine next values (partial update supported)
+    const nextDate = date ? parseDateInput(date) : existing.date;
+    if (!nextDate) return NextResponse.json({ error: "Invalid date" }, { status: 400 });
 
-    const start = toDate(startTime);
-    const end = toDate(endTime);
-    if (!start || !end) return NextResponse.json({ error: "Invalid startTime/endTime" }, { status: 400 });
+    const nextStart = startTime ? toDate(startTime) : existing.startTime;
+    const nextEnd = endTime ? toDate(endTime) : existing.endTime;
+    if (!nextStart || !nextEnd) return NextResponse.json({ error: "Invalid startTime/endTime" }, { status: 400 });
 
-    const sel = parseSelection(selection);
-    if (!sel) return NextResponse.json({ error: "Invalid selection" }, { status: 400 });
+    const selObj = selection ? parseSelection(selection) : parseSelection(JSON.parse(existing.taskCodes || "{}"));
+    if (!selObj) return NextResponse.json({ error: "Invalid selection" }, { status: 400 });
 
-    // ✅ Normalize assignment inputs
-    let normalized: { userId: string; workRole: WorkRole }[] = [];
-
-    if (Array.isArray(assignments) && assignments.length > 0) {
-      normalized = assignments.map((a: any) => ({
-        userId: String(a?.userId || ""),
-        workRole: a?.workRole,
-      }));
-    } else if (Array.isArray(userIds) && userIds.length > 0) {
-      normalized = userIds.map((id: any) => ({
-        userId: String(id),
-        workRole: workRoles?.[id],
-      }));
-    } else {
-      return NextResponse.json({ error: "No users selected" }, { status: 400 });
-    }
-
-    // de-dup
-    const seen = new Set<string>();
-    normalized = normalized.filter((a) => {
-      if (!a.userId) return false;
-      if (seen.has(a.userId)) return false;
-      seen.add(a.userId);
-      return true;
-    });
-
-    const ids = normalized.map((a) => a.userId);
-
-    const users = await prisma.user.findMany({
-      where: { id: { in: ids } },
-      select: { id: true, active: true, defaultWorkRole: true },
-    });
-
-    const found = new Map(users.map((u) => [u.id, u]));
-    const missing = ids.filter((id) => !found.has(id));
-    if (missing.length) {
-      return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
-    }
-
-    const created = await prisma.otEvent.create({
+    // update event
+    await prisma.otEvent.update({
+      where: { id },
       data: {
-        date: eventDate,
-        project,
-        taskNotes: taskNotes || null,
-        startTime: start,
-        endTime: end,
-        taskCodes: JSON.stringify(sel),
-        remark: remark || null,
-        createdById: adminId,
+        date: nextDate,
+        project: typeof project === "string" ? project : undefined,
+        taskNotes: taskNotes === undefined ? undefined : taskNotes || null,
+        startTime: nextStart,
+        endTime: nextEnd,
+        taskCodes: JSON.stringify(selObj),
+        remark: remark === undefined ? undefined : remark || null,
       },
-      select: { id: true },
     });
 
-    const assignmentsData = normalized
-      .map((a) => {
-        const u = found.get(a.userId)!;
-        if (!u.active) return null;
+    // recompute assignments (and optionally sync list)
+    const syncAssignments = Array.isArray(assignments)
+      ? assignments.map((a: any) => ({ userId: String(a?.userId || ""), workRole: a?.workRole }))
+      : null;
 
-        const picked = isWorkRole(a.workRole) ? a.workRole : u.defaultWorkRole;
-        if (!isWorkRole(picked)) return null;
+    await recomputeAllAssignmentsForEvent({
+      eventId: id,
+      start: nextStart,
+      end: nextEnd,
+      selection: selObj,
+      overrides: overrides || null,
+      assignments: syncAssignments,
+    });
 
-        const rm = computeDefaultPayRM({ workRole: picked, start, end, selection: sel });
-        const amountDefault = rmToCents(rm);
-
-        const raw = overrides?.[a.userId];
-        const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
-        const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
-
-        return {
-          otEventId: created.id,
-          userId: a.userId,
-          workRole: picked,
-          amountDefault,
-          amountOverride,
-        };
-      })
-      .filter(Boolean) as any[];
-
-    if (assignmentsData.length === 0) {
-      await prisma.otEvent.delete({ where: { id: created.id } });
-      return NextResponse.json({ error: "No active users to assign" }, { status: 400 });
-    }
-
-    await prisma.otAssignment.createMany({ data: assignmentsData });
-
-    return NextResponse.json({ ok: true, id: created.id });
+    return NextResponse.json({ ok: true });
   } catch (e: any) {
-    const msg = typeof e?.message === "string" ? e.message : "Internal error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return NextResponse.json({ error: e?.message || "Internal error" }, { status: 500 });
+  }
+}
+
+export async function DELETE(_req: Request, ctx: { params: { id: string } }) {
+  const session = await requireAdmin();
+  if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+
+  const id = getId(ctx?.params);
+  if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+
+  try {
+    // ensure exists
+    const ev = await prisma.otEvent.findUnique({ where: { id }, select: { id: true } });
+    if (!ev) return NextResponse.json({ error: "Event not found" }, { status: 404 });
+
+    // delete children first
+    await prisma.otAssignment.deleteMany({ where: { otEventId: id } });
+    await prisma.otEvent.delete({ where: { id } });
+
+    return NextResponse.json({ ok: true });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || "Internal error" }, { status: 500 });
   }
 }
