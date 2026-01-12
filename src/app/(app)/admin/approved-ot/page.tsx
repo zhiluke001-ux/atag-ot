@@ -869,7 +869,7 @@ if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
 
           const selSummary = [
             sel.claim ? CLAIM_LABEL[sel.claim] : "None",
-            sel.codes.length ? sel.codes.map((c: any) => TASK_LABEL[c]).join(" + ") : null,
+            sel.codes?.length ? (sel.codes as TaskCode[]).map((c) => TASK_LABEL[c]).join(" + ") : null,
             sel.custom?.enabled ? `Custom: ${sel.custom.label || "Item"} (RM${sel.custom.amount})` : null,
             sel.note ? `Note: ${sel.note}` : null,
           ]
