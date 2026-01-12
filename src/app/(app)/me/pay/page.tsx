@@ -84,8 +84,6 @@ function fmtTime(iso: string) {
  * Date display:
  * - Normal events: "MM/DD/YYYY" (or your locale)
  * - Multi-day events (2D1N/3D2N): "MM/DD/YYYY - MM/DD/YYYY"
- *
- * We detect multi-day by comparing startTime vs endTime calendar date.
  */
 function fmtDateRangeFromEvent(ev: { date?: string; startTime?: string; endTime?: string }) {
   const start = ev?.startTime ? new Date(ev.startTime) : ev?.date ? new Date(ev.date) : null;
@@ -97,7 +95,6 @@ function fmtDateRangeFromEvent(ev: { date?: string; startTime?: string; endTime?
   const s = start.toLocaleDateString();
   const e = end.toLocaleDateString();
 
-  // If same calendar day, show one date; else show range.
   if (s === e) return s;
   return `${s} - ${e}`;
 }
@@ -312,7 +309,6 @@ function buildRowsForUserFromEvents(events: AdminOtEvent[], userId: string): Pay
     }
   }
 
-  // newest first
   out.sort((x, y) => new Date(y.otEvent.date).getTime() - new Date(x.otEvent.date).getTime());
   return out;
 }
@@ -320,22 +316,22 @@ function buildRowsForUserFromEvents(events: AdminOtEvent[], userId: string): Pay
 /* ---------------- Page ---------------- */
 
 export default function MyPayPage() {
-  // role detection
   const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
 
-  // admin data
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [adminEvents, setAdminEvents] = useState<AdminOtEvent[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<string>("");
   const [userSearch, setUserSearch] = useState("");
 
-  // pay rows
   const [rows, setRows] = useState<PayRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
 
-  const selectedUser = useMemo(() => adminUsers.find((u) => u.id === selectedUserId) || null, [adminUsers, selectedUserId]);
+  const selectedUser = useMemo(
+    () => adminUsers.find((u) => u.id === selectedUserId) || null,
+    [adminUsers, selectedUserId]
+  );
 
   async function loadNormal() {
     setLoading(true);
@@ -399,45 +395,24 @@ export default function MyPayPage() {
     }
   }
 
-async function detectAndLoad() {
-  setMsg(null);
+  // ✅ Correct detect function (NO leftover old code below it)
+  async function detectAndLoad() {
+    setMsg(null);
 
-  try {
-    // ✅ Use a non-admin endpoint to check role
-    const meRes = await fetch("/api/me/profile", { cache: "no-store" });
-    const me = await meRes.json().catch(() => ({}));
+    try {
+      const meRes = await fetch("/api/me/profile", { cache: "no-store" });
+      const me = await meRes.json().catch(() => ({}));
+      const role = me?.user?.role;
 
-    const role = me?.user?.role;
-
-    if (meRes.ok && role === "ADMIN") {
-      setIsAdmin(true);
-      await loadAdminUsersAndEvents(); // calls /api/admin/users + /api/admin/ot-events (now only for admin)
-      return;
-    }
-
-    // normal user
-    setIsAdmin(false);
-    await loadNormal();
-  } catch (e: any) {
-    setIsAdmin(false);
-    await loadNormal();
-  }
-}
-
-
-        const events: AdminOtEvent[] = Array.isArray(ej.events) ? ej.events : [];
-        setAdminEvents(events);
-
-        if (defaultId) setRows(buildRowsForUserFromEvents(events, defaultId));
-        else setRows([]);
-
-        setLoading(false);
+      if (meRes.ok && role === "ADMIN") {
+        setIsAdmin(true);
+        await loadAdminUsersAndEvents();
         return;
       }
 
       setIsAdmin(false);
       await loadNormal();
-    } catch {
+    } catch (e: any) {
       setIsAdmin(false);
       await loadNormal();
     }
@@ -448,7 +423,6 @@ async function detectAndLoad() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // when admin switches user -> rebuild rows from cached events
   useEffect(() => {
     if (!isAdmin) return;
     if (!selectedUserId) return;
@@ -507,7 +481,7 @@ async function detectAndLoad() {
 
         const row = [
           ...(isAdmin ? [selectedUser?.name || "", selectedUser?.email || ""] : []),
-          fmtDateRangeFromEvent(r.otEvent), // ✅ range-aware date
+          fmtDateRangeFromEvent(r.otEvent),
           r.otEvent.project,
           fmtTime(r.otEvent.startTime),
           fmtTime(r.otEvent.endTime),
@@ -530,13 +504,14 @@ async function detectAndLoad() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-start justify-between gap-3 flex-col md:flex-row md:items-center">
         <div>
           <h1 className="text-2xl font-semibold">{isAdmin ? selectedUser?.name || "Select a user" : "My Pay"}</h1>
           <div className="text-sm text-gray-600 mt-1">
             Approved OT assignments + tasks breakdown.
-            {isAdmin && selectedUser?.email ? <span className="ml-2 text-xs text-gray-500">({selectedUser.email})</span> : null}
+            {isAdmin && selectedUser?.email ? (
+              <span className="ml-2 text-xs text-gray-500">({selectedUser.email})</span>
+            ) : null}
           </div>
         </div>
 
@@ -557,7 +532,6 @@ async function detectAndLoad() {
 
       {msg && <div className="text-sm text-red-600">{msg}</div>}
 
-      {/* Admin user switcher (names clickable) */}
       {isAdmin && (
         <div className="bg-white border rounded-xl p-4 space-y-3">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
@@ -593,7 +567,6 @@ async function detectAndLoad() {
         </div>
       )}
 
-      {/* Totals */}
       <div className="grid md:grid-cols-3 gap-3">
         <div className="bg-white border rounded-xl p-4">
           <div className="text-xs text-gray-600">Unpaid Total</div>
@@ -609,7 +582,6 @@ async function detectAndLoad() {
         </div>
       </div>
 
-      {/* Table */}
       <div className="bg-white border rounded-xl overflow-hidden">
         <div className="p-4 border-b flex items-center justify-between">
           <div className="font-semibold">Details</div>
@@ -645,7 +617,6 @@ async function detectAndLoad() {
 
                 return (
                   <tr key={r.id} className={`border-t ${isPaid ? "bg-gray-50 text-gray-600" : "bg-white"}`}>
-                    {/* ✅ Date column now supports 2D1N/3D2N */}
                     <td className="p-2 whitespace-nowrap">{fmtDateRangeFromEvent(r.otEvent)}</td>
 
                     <td className="p-2 min-w-[220px]">
@@ -657,13 +628,17 @@ async function detectAndLoad() {
                       {fmtTime(r.otEvent.startTime)} - {fmtTime(r.otEvent.endTime)}
                     </td>
 
-                    <td className="p-2 whitespace-nowrap text-xs">{(WORK_ROLE_LABEL as any)?.[r.workRole] || r.workRole}</td>
+                    <td className="p-2 whitespace-nowrap text-xs">
+                      {(WORK_ROLE_LABEL as any)?.[r.workRole] || r.workRole}
+                    </td>
 
                     <td className="p-2 text-xs min-w-[280px]">
                       <div className="text-gray-800">{inline}</div>
                     </td>
 
-                    <td className="p-2 text-right whitespace-nowrap font-semibold">RM{centsToRm(r.effectiveCents)}</td>
+                    <td className="p-2 text-right whitespace-nowrap font-semibold">
+                      RM{centsToRm(r.effectiveCents)}
+                    </td>
 
                     <td className="p-2 text-center whitespace-nowrap">
                       <span
@@ -683,11 +658,10 @@ async function detectAndLoad() {
         </div>
       </div>
 
-      {/* Small note for admin */}
       {isAdmin && (
         <div className="text-xs text-gray-500">
-          Admin view builds the breakdown from <code>ot-events.taskCodes</code>. If you want to show <code>paidAt</code> here too,
-          include it inside <code>/api/admin/ot-events</code> assignment payload.
+          Admin view builds the breakdown from <code>ot-events.taskCodes</code>. If you want to show <code>paidAt</code>{" "}
+          here too, include it inside <code>/api/admin/ot-events</code> assignment payload.
         </div>
       )}
     </div>
