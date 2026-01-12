@@ -1,0 +1,113 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Grade {
+  JUNIOR
+  SENIOR
+}
+
+enum WorkRole {
+  JUNIOR_MARSHAL
+  SENIOR_MARSHAL
+  JUNIOR_EMCEE
+  SENIOR_EMCEE
+}
+
+enum PayStatus {
+  UNPAID
+  PAID
+}
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  password  String
+
+  role      Role     @default(USER)
+
+  // optional, if you still show (JUNIOR)/(SENIOR) in UI
+  grade     Grade    @default(JUNIOR)
+
+  // default role used when admin selects user
+  defaultWorkRole WorkRole @default(JUNIOR_MARSHAL)
+
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // relations
+  assignments            OtAssignment[]
+  createdEvents          OtEvent[]       @relation("CreatedBy")
+  paidMarkedAssignments  OtAssignment[]  @relation("PaidBy")
+}
+
+model OtEvent {
+  id        String   @id @default(cuid())
+  date      DateTime
+  project   String
+
+  taskNotes String?  // optional legacy / future use
+
+  startTime DateTime
+  endTime   DateTime
+
+  // store your TaskSelection JSON string here (JSON.stringify(selection))
+  taskCodes String
+
+  remark    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  createdById String
+  createdBy   User   @relation("CreatedBy", fields: [createdById], references: [id])
+
+  assignments OtAssignment[]
+
+  @@index([date])
+  @@index([createdById])
+}
+
+model OtAssignment {
+  id        String   @id @default(cuid())
+  otEventId String
+  userId    String
+
+  // ✅ per-event role
+  workRole  WorkRole @default(JUNIOR_MARSHAL)
+
+  status    PayStatus @default(UNPAID)
+
+  // ✅ store as CENTS (Int) to avoid Decimal serialization → NaN
+  amountDefault  Int
+  amountOverride Int?
+
+  paidAt   DateTime?
+  paidById String?
+  paidBy   User?    @relation("PaidBy", fields: [paidById], references: [id])
+
+  otEvent OtEvent @relation(fields: [otEventId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([otEventId, userId])
+
+  @@index([userId])
+  @@index([otEventId])
+  @@index([status])
+  @@index([workRole])
+}
