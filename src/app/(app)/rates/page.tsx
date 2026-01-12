@@ -35,7 +35,7 @@ export default function RatesPage() {
               <b>Backend:</b> RM15 per hour (Annual Dinner / Karaoke / Packing / Set Up)
             </p>
             <p>
-              <b>Event starts after 6PM (RM30 | RM20 per hour)
+              <b>Event starts after 6PM</b> (RM30 | RM20 per hour)
             </p>
             <p>
               <b>Early Calling:</b> RM30 
