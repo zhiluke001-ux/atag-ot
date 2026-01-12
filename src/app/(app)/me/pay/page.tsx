@@ -6,7 +6,7 @@ import {
   centsToRm,
   WORK_ROLE_LABEL,
   formatPayBreakdownInline,
-  // for admin-side breakdown building (from ot-events.taskCodes)
+  // admin-side breakdown building (from ot-events.taskCodes)
   CLAIM_LABEL,
   TASK_LABEL,
   resolveAddOnRates,
@@ -33,10 +33,10 @@ type PayRow = {
   paidAt: string | null;
 
   otEvent: {
-    date: string;
+    date: string; // event "anchor" date (often day-1)
     project: string;
-    startTime: string;
-    endTime: string;
+    startTime: string; // ISO datetime
+    endTime: string; // ISO datetime (can be next day(s))
     remark: string | null;
     taskCodes?: string;
   };
@@ -78,6 +78,28 @@ function fmtDate(iso: string) {
 }
 function fmtTime(iso: string) {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * Date display:
+ * - Normal events: "MM/DD/YYYY" (or your locale)
+ * - Multi-day events (2D1N/3D2N): "MM/DD/YYYY - MM/DD/YYYY"
+ *
+ * We detect multi-day by comparing startTime vs endTime calendar date.
+ */
+function fmtDateRangeFromEvent(ev: { date?: string; startTime?: string; endTime?: string }) {
+  const start = ev?.startTime ? new Date(ev.startTime) : ev?.date ? new Date(ev.date) : null;
+  const end = ev?.endTime ? new Date(ev.endTime) : ev?.date ? new Date(ev.date) : null;
+
+  if (!start || Number.isNaN(start.getTime())) return ev?.date ? fmtDate(ev.date) : "-";
+  if (!end || Number.isNaN(end.getTime())) return start.toLocaleDateString();
+
+  const s = start.toLocaleDateString();
+  const e = end.toLocaleDateString();
+
+  // If same calendar day, show one date; else show range.
+  if (s === e) return s;
+  return `${s} - ${e}`;
 }
 
 /* ---------------- CSV helpers ---------------- */
@@ -313,10 +335,7 @@ export default function MyPayPage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
 
-  const selectedUser = useMemo(
-    () => adminUsers.find((u) => u.id === selectedUserId) || null,
-    [adminUsers, selectedUserId]
-  );
+  const selectedUser = useMemo(() => adminUsers.find((u) => u.id === selectedUserId) || null, [adminUsers, selectedUserId]);
 
   async function loadNormal() {
     setLoading(true);
@@ -365,16 +384,11 @@ export default function MyPayPage() {
       setAdminUsers(users);
       setAdminEvents(events);
 
-      // default selection = first user (if not already selected)
       const defaultId = selectedUserId || users?.[0]?.id || "";
       setSelectedUserId(defaultId);
 
-      // build rows for selected
-      if (defaultId) {
-        setRows(buildRowsForUserFromEvents(events, defaultId));
-      } else {
-        setRows([]);
-      }
+      if (defaultId) setRows(buildRowsForUserFromEvents(events, defaultId));
+      else setRows([]);
     } catch (e: any) {
       setMsg(e?.message || "Failed to load admin data");
       setAdminUsers([]);
@@ -395,16 +409,13 @@ export default function MyPayPage() {
       if (uRes.ok) {
         setIsAdmin(true);
 
-        // load users + events together (fresh)
         const uj = await uRes.json().catch(() => ({}));
         const users: AdminUser[] = Array.isArray(uj.users) ? uj.users : [];
         setAdminUsers(users);
 
-        // pick default user
         const defaultId = users?.[0]?.id || "";
         setSelectedUserId(defaultId);
 
-        // now load events and build rows
         const eRes = await fetch("/api/admin/ot-events", { cache: "no-store" });
         const ej = await eRes.json().catch(() => ({}));
         if (!eRes.ok) {
@@ -425,11 +436,9 @@ export default function MyPayPage() {
         return;
       }
 
-      // not admin
       setIsAdmin(false);
       await loadNormal();
     } catch {
-      // fallback normal
       setIsAdmin(false);
       await loadNormal();
     }
@@ -499,7 +508,7 @@ export default function MyPayPage() {
 
         const row = [
           ...(isAdmin ? [selectedUser?.name || "", selectedUser?.email || ""] : []),
-          fmtDate(r.otEvent.date),
+          fmtDateRangeFromEvent(r.otEvent), // ✅ range-aware date
           r.otEvent.project,
           fmtTime(r.otEvent.startTime),
           fmtTime(r.otEvent.endTime),
@@ -525,9 +534,7 @@ export default function MyPayPage() {
       {/* Header */}
       <div className="flex items-start justify-between gap-3 flex-col md:flex-row md:items-center">
         <div>
-          <h1 className="text-2xl font-semibold">
-            {isAdmin ? (selectedUser?.name || "Select a user") : "My Pay"}
-          </h1>
+          <h1 className="text-2xl font-semibold">{isAdmin ? selectedUser?.name || "Select a user" : "My Pay"}</h1>
           <div className="text-sm text-gray-600 mt-1">
             Approved OT assignments + tasks breakdown.
             {isAdmin && selectedUser?.email ? <span className="ml-2 text-xs text-gray-500">({selectedUser.email})</span> : null}
@@ -639,23 +646,26 @@ export default function MyPayPage() {
 
                 return (
                   <tr key={r.id} className={`border-t ${isPaid ? "bg-gray-50 text-gray-600" : "bg-white"}`}>
-                    <td className="p-2 whitespace-nowrap">{fmtDate(r.otEvent.date)}</td>
+                    {/* ✅ Date column now supports 2D1N/3D2N */}
+                    <td className="p-2 whitespace-nowrap">{fmtDateRangeFromEvent(r.otEvent)}</td>
+
                     <td className="p-2 min-w-[220px]">
                       <div className="font-medium">{r.otEvent.project}</div>
                       {r.otEvent.remark && <div className="text-xs text-gray-600 mt-0.5">Remark: {r.otEvent.remark}</div>}
                     </td>
+
                     <td className="p-2 whitespace-nowrap">
                       {fmtTime(r.otEvent.startTime)} - {fmtTime(r.otEvent.endTime)}
                     </td>
-                    <td className="p-2 whitespace-nowrap text-xs">
-                      {(WORK_ROLE_LABEL as any)?.[r.workRole] || r.workRole}
-                    </td>
+
+                    <td className="p-2 whitespace-nowrap text-xs">{(WORK_ROLE_LABEL as any)?.[r.workRole] || r.workRole}</td>
 
                     <td className="p-2 text-xs min-w-[280px]">
                       <div className="text-gray-800">{inline}</div>
                     </td>
 
                     <td className="p-2 text-right whitespace-nowrap font-semibold">RM{centsToRm(r.effectiveCents)}</td>
+
                     <td className="p-2 text-center whitespace-nowrap">
                       <span
                         className={`inline-flex items-center px-2 py-0.5 rounded text-xs border ${
