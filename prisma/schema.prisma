@@ -37,10 +37,8 @@ model User {
 
   role      Role     @default(USER)
 
-  // optional, if you still show (JUNIOR)/(SENIOR) in UI
   grade     Grade    @default(JUNIOR)
 
-  // default role used when admin selects user
   defaultWorkRole WorkRole @default(JUNIOR_MARSHAL)
 
   active    Boolean  @default(true)
@@ -58,12 +56,13 @@ model OtEvent {
   date      DateTime
   project   String
 
-  taskNotes String?  // optional legacy / future use
+  taskNotes String?
 
+  // legacy event time range (we keep it, but for multi-slot we set to min/max)
   startTime DateTime
   endTime   DateTime
 
-  // store your TaskSelection JSON string here (JSON.stringify(selection))
+  // legacy selection json (we keep it, set to slot[0].taskCodes for backward compat)
   taskCodes String
 
   remark    String?
@@ -74,10 +73,35 @@ model OtEvent {
   createdById String
   createdBy   User   @relation("CreatedBy", fields: [createdById], references: [id])
 
+  // legacy relation kept (still exists, but now assignments also link to slot)
   assignments OtAssignment[]
+
+  // ✅ NEW
+  slots OtSlot[]
 
   @@index([date])
   @@index([createdById])
+}
+
+model OtSlot {
+  id        String   @id @default(cuid())
+  otEventId String
+  index     Int      @default(0)
+
+  startTime DateTime
+  endTime   DateTime
+
+  // store TaskSelection JSON string here (JSON.stringify(selection))
+  taskCodes String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  otEvent      OtEvent        @relation(fields: [otEventId], references: [id], onDelete: Cascade)
+  assignments  OtAssignment[]
+
+  @@index([otEventId])
+  @@index([otEventId, index])
 }
 
 model OtAssignment {
@@ -85,12 +109,14 @@ model OtAssignment {
   otEventId String
   userId    String
 
-  // ✅ per-event role
+  // ✅ NEW: assignment belongs to a slot
+  // Make optional for migration/backfill, then you can make it required later.
+  otSlotId  String?
+
   workRole  WorkRole @default(JUNIOR_MARSHAL)
 
   status    PayStatus @default(UNPAID)
 
-  // ✅ store as CENTS (Int) to avoid Decimal serialization → NaN
   amountDefault  Int
   amountOverride Int?
 
@@ -99,15 +125,21 @@ model OtAssignment {
   paidBy   User?    @relation("PaidBy", fields: [paidById], references: [id])
 
   otEvent OtEvent @relation(fields: [otEventId], references: [id], onDelete: Cascade)
+  otSlot  OtSlot? @relation(fields: [otSlotId], references: [id], onDelete: Cascade)
+
   user    User    @relation(fields: [userId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([otEventId, userId])
+  // OLD: @@unique([otEventId, userId]) is NOT compatible with multi-slot
+  // A user may appear in multiple slots for the same event.
+  // ✅ Replace with this:
+  @@unique([otEventId, userId, otSlotId])
 
   @@index([userId])
   @@index([otEventId])
+  @@index([otSlotId])
   @@index([status])
   @@index([workRole])
 }
