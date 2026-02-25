@@ -35,15 +35,44 @@ type Assignment = {
   user: { name: string; email: string };
 };
 
+type OtSlot = {
+  id: string;
+  index: number;
+  startTime: string; // ISO
+  endTime: string; // ISO
+  taskCodes: string; // JSON string of TaskSelection
+  assignments: Assignment[];
+};
+
 type OtEvent = {
   id: string;
-  date: string; // start date (kept for backward compatibility)
+  date: string; // legacy
   project: string;
-  startTime: string; // ISO
-  endTime: string; // ISO (can be next day / multi-day)
-  taskCodes: string;
   remark: string | null;
-  assignments: Assignment[];
+  // legacy range kept in DB, but UI uses slots
+  startTime: string;
+  endTime: string;
+  taskCodes: string;
+  slots: OtSlot[];
+};
+
+/* ---------------- Slot form state ---------------- */
+
+type SlotForm = {
+  tempId: string; // stable key for UI
+  id?: string; // real slot id when editing; undefined for new slots
+  index: number;
+
+  date: string; // YYYY-MM-DD
+  endDate: string; // YYYY-MM-DD (for 2D1N/3D2N)
+  startTime: string; // HH:mm
+  endTime: string; // HH:mm
+
+  selection: TaskSelection;
+
+  selectedUserIds: string[];
+  roleByUserId: Record<string, WorkRole>;
+  overrides: Record<string, string>; // RM string per user (override)
 };
 
 /* ---------------- Safe helpers ---------------- */
@@ -100,6 +129,25 @@ function safeParseSelection(taskCodes: string): TaskSelection {
       custom: { enabled: false, label: "", amount: "" },
     } as TaskSelection;
   }
+}
+
+function newEmptySelection(): TaskSelection {
+  return {
+    claim: null,
+    codes: [],
+    note: "",
+    baseRates: {},
+    addOnRates: {},
+    custom: { enabled: false, label: "", amount: "" } as any,
+  } as TaskSelection;
+}
+
+function makeTempId() {
+  return `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
+function isMultiDayClaim(claim: ClaimCode | null) {
+  return claim === "EVENT_2D1N" || claim === "EVENT_3D2N";
 }
 
 /* ---------------- Task + Pay breakdown (display + export) ---------------- */
@@ -541,71 +589,73 @@ export default function ApprovedOTAdminPage() {
   const [events, setEvents] = useState<OtEvent[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
 
+  // export state
   const [exportBusy, setExportBusy] = useState(false);
 
+  // event-level form
   const [project, setProject] = useState("");
-  const [modalOpen, setModalOpen] = useState(false);
-
-  const [date, setDate] = useState("");
-  const [endDate, setEndDate] = useState("");
-
-  const [startTime, setStartTime] = useState("18:00");
-  const [endTime, setEndTime] = useState("20:00");
-
   const [remark, setRemark] = useState("");
 
-  const [selection, setSelection] = useState<TaskSelection>({
-    claim: null,
-    codes: [],
-    note: "",
-    baseRates: {},
-    addOnRates: {},
-    custom: { enabled: false, label: "", amount: "" } as any,
-  } as TaskSelection);
-
-  const isMultiDay = selection.claim === "EVENT_2D1N" || selection.claim === "EVENT_3D2N";
-
-  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
-  const [roleByUserId, setRoleByUserId] = useState<Record<string, WorkRole>>({});
-  const [overrides, setOverrides] = useState<Record<string, string>>({});
-
+  // Edit mode
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
+
+  // slots form
+  const [slots, setSlots] = useState<SlotForm[]>([
+    {
+      tempId: makeTempId(),
+      index: 0,
+      date: "",
+      endDate: "",
+      startTime: "18:00",
+      endTime: "20:00",
+      selection: newEmptySelection(),
+      selectedUserIds: [],
+      roleByUserId: {},
+      overrides: {},
+    },
+  ]);
+
+  // modal state (per-slot)
+  const [modalOpen, setModalOpen] = useState(false);
+  const [activeSlotTempId, setActiveSlotTempId] = useState<string | null>(null);
+
+  function openSlotModal(slotTempId: string) {
+    setActiveSlotTempId(slotTempId);
+    setModalOpen(true);
+  }
 
   function combineDateTime(d: string, t: string) {
     return new Date(`${d}T${t}:00`);
   }
 
-  useEffect(() => {
-    if (!date) return;
-
-    if (isMultiDay) {
-      if (!endDate || endDate === date) {
-        const delta = selection.claim === "EVENT_3D2N" ? 2 : 1;
-        setEndDate(addDaysToIsoDate(date, delta));
-      }
-    } else {
-      if (endDate !== date) setEndDate(date);
+  function slotSelectionSummary(sel: TaskSelection) {
+    const parts: string[] = [];
+    parts.push(sel.claim ? CLAIM_LABEL[sel.claim] : "None");
+    const codes = (sel.codes ?? []) as TaskCode[];
+    if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
+    if (sel.custom?.enabled && (sel.custom as any)?.amount) {
+      parts.push(`Custom: ${(sel.custom as any).label || "Item"} (RM${(sel.custom as any).amount})`);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selection.claim, date]);
+    if (sel.note) parts.push(`Note: ${sel.note}`);
+    return parts.join(" · ");
+  }
 
-  const selectedUsers = useMemo(() => users.filter((u) => selectedUserIds.includes(u.id)), [users, selectedUserIds]);
+  function syncSlotEndDate(next: SlotForm): SlotForm {
+    const multi = isMultiDayClaim(next.selection.claim ?? null);
+    if (!next.date) return next;
 
-  const preview = useMemo(() => {
-    if (!date) return [];
+    if (multi) {
+      if (!next.endDate || next.endDate === next.date) {
+        const delta = next.selection.claim === "EVENT_3D2N" ? 2 : 1;
+        return { ...next, endDate: addDaysToIsoDate(next.date, delta) };
+      }
+      return next;
+    }
 
-    const endDateUsed = isMultiDay ? endDate : date;
-    if (isMultiDay && !endDateUsed) return [];
-
-    const start = combineDateTime(date, startTime);
-    const end = combineDateTime(endDateUsed, endTime);
-
-    return selectedUsers.map((u) => {
-      const workRole = roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
-      const rm = computeDefaultPayRM({ workRole, start, end, selection });
-      return { user: u, workRole, defaultRM: rm };
-    });
-  }, [selectedUsers, roleByUserId, selection, date, endDate, startTime, endTime, isMultiDay]);
+    // non-multi: keep endDate = date
+    if (next.endDate !== next.date) return { ...next, endDate: next.date };
+    return next;
+  }
 
   async function loadAll() {
     setMsg(null);
@@ -626,98 +676,169 @@ export default function ApprovedOTAdminPage() {
     loadAll();
   }, []);
 
-  function toggleUser(u: User) {
-    setSelectedUserIds((prev) => {
-      const exists = prev.includes(u.id);
-      return exists ? prev.filter((x) => x !== u.id) : [...prev, u.id];
-    });
-
-    setRoleByUserId((prev) => {
-      if (prev[u.id]) return prev;
-      return { ...prev, [u.id]: u.defaultWorkRole || "JUNIOR_MARSHAL" };
-    });
-  }
-
   const workRoleOptions: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCEE", "SENIOR_EMCEE"];
 
   function resetCreateForm() {
     setEditingEventId(null);
-
     setProject("");
-    setDate("");
-    setEndDate("");
-    setStartTime("18:00");
-    setEndTime("20:00");
     setRemark("");
 
-    setSelection({
-      claim: null,
-      codes: [],
-      note: "",
-      baseRates: {},
-      addOnRates: {},
-      custom: { enabled: false, label: "", amount: "" } as any,
-    } as TaskSelection);
-
-    setSelectedUserIds([]);
-    setRoleByUserId({});
-    setOverrides({});
+    setSlots([
+      {
+        tempId: makeTempId(),
+        index: 0,
+        date: "",
+        endDate: "",
+        startTime: "18:00",
+        endTime: "20:00",
+        selection: newEmptySelection(),
+        selectedUserIds: [],
+        roleByUserId: {},
+        overrides: {},
+      },
+    ]);
   }
 
-  function fillFormFromEvent(ev: OtEvent) {
-    setEditingEventId(ev.id);
+  function addSlot() {
+    setSlots((prev) => {
+      const baseDate = prev[0]?.date || "";
+      const nextIndex = prev.length;
+      const s: SlotForm = {
+        tempId: makeTempId(),
+        index: nextIndex,
+        date: baseDate,
+        endDate: baseDate,
+        startTime: "18:00",
+        endTime: "20:00",
+        selection: newEmptySelection(),
+        selectedUserIds: [],
+        roleByUserId: {},
+        overrides: {},
+      };
+      return [...prev, syncSlotEndDate(s)];
+    });
+  }
 
-    const s = new Date(ev.startTime);
-    const e = new Date(ev.endTime);
+  function removeSlot(tempId: string) {
+    setSlots((prev) => {
+      if (prev.length <= 1) return prev; // must keep at least one
+      const next = prev.filter((s) => s.tempId !== tempId);
+      // re-index
+      return next.map((s, i) => ({ ...s, index: i }));
+    });
+  }
 
-    setProject(ev.project || "");
-    setDate(isoDateOnly(s));
-    setEndDate(isoDateOnly(e));
-    setStartTime(hhmmFromIso(ev.startTime));
-    setEndTime(hhmmFromIso(ev.endTime));
-    setRemark(ev.remark || "");
+  function updateSlot(tempId: string, patch: Partial<SlotForm>) {
+    setSlots((prev) =>
+      prev.map((s) => {
+        if (s.tempId !== tempId) return s;
+        const merged = { ...s, ...patch };
+        return syncSlotEndDate(merged);
+      })
+    );
+  }
 
-    const sel = safeParseSelection(ev.taskCodes || "{}");
-    setSelection(sel);
+  function toggleUserInSlot(slotTempId: string, u: User) {
+    setSlots((prev) =>
+      prev.map((s) => {
+        if (s.tempId !== slotTempId) return s;
 
-    const ids = ev.assignments.map((a) => a.userId).filter(Boolean);
-    setSelectedUserIds(ids);
+        const exists = s.selectedUserIds.includes(u.id);
+        const selectedUserIds = exists ? s.selectedUserIds.filter((x) => x !== u.id) : [...s.selectedUserIds, u.id];
 
-    const roles: Record<string, WorkRole> = {};
-    const ovs: Record<string, string> = {};
-    for (const a of ev.assignments) {
-      const uid = a.userId;
-      roles[uid] = a.workRole;
-      if (a.amountOverride !== null && a.amountOverride !== undefined) {
-        ovs[uid] = (Number(a.amountOverride) / 100).toFixed(2);
-      }
-    }
-    setRoleByUserId(roles);
-    setOverrides(ovs);
+        const roleByUserId = { ...s.roleByUserId };
+        if (!roleByUserId[u.id]) roleByUserId[u.id] = u.defaultWorkRole || "JUNIOR_MARSHAL";
+
+        // if removing, also remove overrides/role to keep state clean
+        if (exists) {
+          delete roleByUserId[u.id];
+          const overrides = { ...s.overrides };
+          delete overrides[u.id];
+          return { ...s, selectedUserIds, roleByUserId, overrides };
+        }
+
+        return { ...s, selectedUserIds, roleByUserId };
+      })
+    );
+  }
+
+  function getSlotPreview(slot: SlotForm) {
+    if (!slot.date) return [];
+    const multi = isMultiDayClaim(slot.selection.claim ?? null);
+    const endDateUsed = multi ? slot.endDate : slot.date;
+    if (multi && !endDateUsed) return [];
+
+    const start = combineDateTime(slot.date, slot.startTime);
+    const end = combineDateTime(endDateUsed, slot.endTime);
+
+    const selectedUsers = users.filter((u) => slot.selectedUserIds.includes(u.id));
+    return selectedUsers.map((u) => {
+      const workRole = slot.roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
+      const rm = computeDefaultPayRM({ workRole, start, end, selection: slot.selection });
+      return { user: u, workRole, defaultRM: rm };
+    });
   }
 
   async function createOrUpdateEvent() {
     setMsg(null);
 
-    const endDateUsed = isMultiDay ? endDate : date;
-
-    if (!project || !date || (isMultiDay && !endDateUsed) || selectedUserIds.length === 0) {
-      setMsg(isMultiDay ? "Please fill project + start date + end date and select users." : "Please fill project + date and select users.");
+    if (!project.trim()) {
+      setMsg("Please fill project.");
+      return;
+    }
+    if (!slots.length) {
+      setMsg("Please add at least 1 slot.");
       return;
     }
 
-    if (endDateUsed < date) {
-      setMsg("End date cannot be earlier than start date.");
-      return;
+    for (const s of slots) {
+      const multi = isMultiDayClaim(s.selection.claim ?? null);
+      const endDateUsed = multi ? s.endDate : s.date;
+
+      if (!s.date || (multi && !endDateUsed)) {
+        setMsg("Please fill date(s) for all slots.");
+        return;
+      }
+      if (multi && endDateUsed < s.date) {
+        setMsg("Slot end date cannot be earlier than start date.");
+        return;
+      }
+      if (s.selectedUserIds.length === 0) {
+        setMsg("Each slot must have at least 1 assigned user.");
+        return;
+      }
+
+      const start = combineDateTime(s.date, s.startTime);
+      const end = combineDateTime(endDateUsed, s.endTime);
+      if (!(end.getTime() > start.getTime())) {
+        setMsg("Slot end time must be later than start time.");
+        return;
+      }
     }
 
-    const start = combineDateTime(date, startTime);
-    const end = combineDateTime(endDateUsed, endTime);
+    const payloadSlots = slots.map((s, idx) => {
+      const multi = isMultiDayClaim(s.selection.claim ?? null);
+      const endDateUsed = multi ? s.endDate : s.date;
 
-    const assignments = selectedUserIds.map((id) => ({
-      userId: id,
-      workRole: roleByUserId[id] || users.find((u) => u.id === id)?.defaultWorkRole || "JUNIOR_MARSHAL",
-    }));
+      const start = combineDateTime(s.date, s.startTime);
+      const end = combineDateTime(endDateUsed, s.endTime);
+
+      const assignments = s.selectedUserIds.map((uid) => {
+        const u = users.find((x) => x.id === uid);
+        const picked = s.roleByUserId[uid] || u?.defaultWorkRole || "JUNIOR_MARSHAL";
+        return { userId: uid, workRole: picked };
+      });
+
+      return {
+        id: s.id, // undefined for new slot
+        index: idx,
+        startTime: start.toISOString(),
+        endTime: end.toISOString(),
+        selection: s.selection,
+        assignments,
+        overrides: s.overrides,
+      };
+    });
 
     const url = editingEventId ? `/api/admin/ot-events/${editingEventId}` : "/api/admin/ot-events";
     const method = editingEventId ? "PATCH" : "POST";
@@ -726,14 +847,9 @@ export default function ApprovedOTAdminPage() {
       method,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        date,
         project,
-        startTime: start.toISOString(),
-        endTime: end.toISOString(),
         remark: remark || null,
-        selection,
-        assignments,
-        overrides,
+        slots: payloadSlots,
       }),
     });
 
@@ -749,7 +865,7 @@ export default function ApprovedOTAdminPage() {
   }
 
   async function deleteEvent(eventId: string) {
-    const ok = confirm("Delete this Approved OT event? This will remove assignments too.");
+    const ok = confirm("Delete this Approved OT event? This will remove slots & assignments too.");
     if (!ok) return;
 
     setMsg(null);
@@ -778,18 +894,67 @@ export default function ApprovedOTAdminPage() {
     await loadAll();
   }
 
-  const selectionSummary = useMemo(() => {
-    const parts: string[] = [];
-    parts.push(selection.claim ? CLAIM_LABEL[selection.claim] : "None");
-    const codes = (selection.codes ?? []) as TaskCode[];
-    if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
-    if (selection.custom?.enabled && (selection.custom as any)?.amount) {
-      parts.push(`Custom: ${(selection.custom as any).label || "Item"} (RM${(selection.custom as any).amount})`);
-    }
-    if (selection.note) parts.push(`Note: ${selection.note}`);
-    return parts.join(" · ");
-  }, [selection]);
+  function fillFormFromEvent(ev: OtEvent) {
+    setEditingEventId(ev.id);
+    setProject(ev.project || "");
+    setRemark(ev.remark || "");
 
+    const slotForms: SlotForm[] = (ev.slots || [])
+      .slice()
+      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+      .map((sl, i) => {
+        const start = new Date(sl.startTime);
+        const end = new Date(sl.endTime);
+
+        const sel = safeParseSelection(sl.taskCodes || "{}");
+
+        const selectedUserIds = (sl.assignments || []).map((a) => a.userId).filter(Boolean);
+
+        const roleByUserId: Record<string, WorkRole> = {};
+        const overrides: Record<string, string> = {};
+        for (const a of sl.assignments || []) {
+          roleByUserId[a.userId] = a.workRole;
+          if (a.amountOverride !== null && a.amountOverride !== undefined) {
+            overrides[a.userId] = (Number(a.amountOverride) / 100).toFixed(2);
+          }
+        }
+
+        // legacy pseudo-slot id starts with "__legacy__" (backend will do this)
+        const realId = sl.id?.startsWith("__legacy__") ? undefined : sl.id;
+
+        const s: SlotForm = {
+          tempId: makeTempId(),
+          id: realId,
+          index: i,
+          date: isoDateOnly(start),
+          endDate: isoDateOnly(end),
+          startTime: hhmmFromIso(sl.startTime),
+          endTime: hhmmFromIso(sl.endTime),
+          selection: sel,
+          selectedUserIds,
+          roleByUserId,
+          overrides,
+        };
+        return syncSlotEndDate(s);
+      });
+
+    setSlots(slotForms.length ? slotForms : [
+      {
+        tempId: makeTempId(),
+        index: 0,
+        date: "",
+        endDate: "",
+        startTime: "18:00",
+        endTime: "20:00",
+        selection: newEmptySelection(),
+        selectedUserIds: [],
+        roleByUserId: {},
+        overrides: {},
+      },
+    ]);
+  }
+
+  /* ---------------- Export approved OT to CSV (slot-aware) ---------------- */
   async function exportToCsv() {
     try {
       setExportBusy(true);
@@ -806,22 +971,24 @@ export default function ApprovedOTAdminPage() {
       const evs: OtEvent[] = ej.events || [];
 
       const headers = [
-        "StartDate",
-        "EndDate",
         "Project",
-        "StartTime",
-        "EndTime",
         "Remark",
+        "SlotIndex",
+        "SlotStartDate",
+        "SlotEndDate",
+        "SlotStartTime",
+        "SlotEndTime",
+        "TaskSummary",
+        "Breakdown",
         "UserName",
         "UserEmail",
         "WorkRole",
-        "TaskSummary",
-        "Breakdown",
         "DefaultRM",
         "OverrideRM",
         "EffectiveRM",
         "Status",
         "EventId",
+        "SlotId",
         "AssignmentId",
       ];
 
@@ -829,58 +996,64 @@ export default function ApprovedOTAdminPage() {
       rows.push(headers.map(csvEscape).join(","));
 
       for (const ev of evs) {
-        const sel = safeParseSelection(ev.taskCodes || "{}");
+        const sortedSlots = (ev.slots || []).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 
-        const taskSummary = [
-          sel.claim ? CLAIM_LABEL[sel.claim] : "None",
-          sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
-          sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
-          sel.note ? `Note: ${sel.note}` : null,
-        ]
-          .filter(Boolean)
-          .join(" · ");
+        for (const sl of sortedSlots) {
+          const sel = safeParseSelection(sl.taskCodes || "{}");
 
-        const start = new Date(ev.startTime);
-        const end = new Date(ev.endTime);
+          const taskSummary = [
+            sel.claim ? CLAIM_LABEL[sel.claim] : "None",
+            sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
+            sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
+            sel.note ? `Note: ${sel.note}` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
 
-        const startDateLabel = isoDateOnly(start);
-        const endDateLabel = isoDateOnly(end);
+          const start = new Date(sl.startTime);
+          const end = new Date(sl.endTime);
 
-        for (const a of ev.assignments || []) {
-          const defaultCents = Number(a.amountDefault ?? 0);
-          const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
-          const effectiveCents = overrideCents ?? defaultCents;
+          const startDateLabel = isoDateOnly(start);
+          const endDateLabel = isoDateOnly(end);
 
-          const breakdown = buildTaskPayBreakdown({
-            workRole: a.workRole,
-            start,
-            end,
-            selection: sel,
-          });
+          for (const a of sl.assignments || []) {
+            const defaultCents = Number(a.amountDefault ?? 0);
+            const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
+            const effectiveCents = overrideCents ?? defaultCents;
 
-          const breakdownInline = formatBreakdownInline(breakdown.lines);
+            const breakdown = buildTaskPayBreakdown({
+              workRole: a.workRole,
+              start,
+              end,
+              selection: sel,
+            });
 
-          const line = [
-            startDateLabel,
-            endDateLabel,
-            ev.project || "",
-            toLocalTime(start),
-            toLocalTime(end),
-            ev.remark || "",
-            a.user?.name || "",
-            a.user?.email || "",
-            WORK_ROLE_LABEL[a.workRole] || a.workRole,
-            taskSummary,
-            breakdownInline,
-            centsToRm(defaultCents),
-            overrideCents === null ? "" : centsToRm(overrideCents),
-            centsToRm(effectiveCents),
-            a.status,
-            ev.id,
-            a.id,
-          ];
+            const breakdownInline = formatBreakdownInline(breakdown.lines);
 
-          rows.push(line.map(csvEscape).join(","));
+            const line = [
+              ev.project || "",
+              ev.remark || "",
+              String(sl.index ?? 0),
+              startDateLabel,
+              endDateLabel,
+              toLocalTime(start),
+              toLocalTime(end),
+              taskSummary,
+              breakdownInline,
+              a.user?.name || "",
+              a.user?.email || "",
+              WORK_ROLE_LABEL[a.workRole] || a.workRole,
+              centsToRm(defaultCents),
+              overrideCents === null ? "" : centsToRm(overrideCents),
+              centsToRm(effectiveCents),
+              a.status,
+              ev.id,
+              sl.id,
+              a.id,
+            ];
+
+            rows.push(line.map(csvEscape).join(","));
+          }
         }
       }
 
@@ -894,6 +1067,9 @@ export default function ApprovedOTAdminPage() {
       setExportBusy(false);
     }
   }
+
+  // modal selection binding
+  const activeSlot = useMemo(() => slots.find((s) => s.tempId === activeSlotTempId) || null, [slots, activeSlotTempId]);
 
   return (
     <div className="space-y-6 text-gray-900">
@@ -914,9 +1090,10 @@ export default function ApprovedOTAdminPage() {
         </button>
       </div>
 
-      <div className="bg-white border-2 border-black rounded-xl p-4">
-        <div className="flex items-center justify-between mb-3">
-          <div className="text-sm font-semibold">{editingEventId ? "Edit Approved OT" : "Create Approved OT"}</div>
+      {/* Create / Edit form */}
+      <div className="bg-white border-2 border-black rounded-xl p-4 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold">{editingEventId ? "Edit Approved OT (Multi-slot)" : "Create Approved OT (Multi-slot)"}</div>
           {editingEventId && (
             <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={resetCreateForm}>
               Cancel Edit
@@ -936,78 +1113,6 @@ export default function ApprovedOTAdminPage() {
             </div>
 
             <div>
-              <label className="text-sm font-semibold">Task Description</label>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  className="px-3 py-2 border-2 border-black rounded bg-white text-gray-900"
-                  onClick={() => setModalOpen(true)}
-                >
-                  Select tasks
-                </button>
-              </div>
-              <div className="text-xs text-gray-700 mt-2">{selectionSummary}</div>
-            </div>
-
-            {!isMultiDay ? (
-              <div>
-                <label className="text-sm font-semibold">Date</label>
-                <input
-                  className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                  type="date"
-                  value={date}
-                  onChange={(e) => setDate(e.target.value)}
-                />
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                  <label className="text-sm font-semibold">Start Date</label>
-                  <input
-                    className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                    type="date"
-                    value={date}
-                    onChange={(e) => setDate(e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label className="text-sm font-semibold">End Date</label>
-                  <input
-                    className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                    type="date"
-                    value={endDate}
-                    min={date || undefined}
-                    onChange={(e) => setEndDate(e.target.value)}
-                  />
-                </div>
-                <div className="md:col-span-2 text-xs text-gray-700">
-                  For <b>2D1N</b> / <b>3D2N</b>, pick both start & end dates.
-                </div>
-              </div>
-            )}
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-sm font-semibold">Start Time</label>
-                <input
-                  className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                  type="time"
-                  value={startTime}
-                  onChange={(e) => setStartTime(e.target.value)}
-                />
-              </div>
-              <div>
-                <label className="text-sm font-semibold">End Time</label>
-                <input
-                  className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                  type="time"
-                  value={endTime}
-                  onChange={(e) => setEndTime(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div>
               <label className="text-sm font-semibold">Remark</label>
               <input
                 className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
@@ -1015,122 +1120,234 @@ export default function ApprovedOTAdminPage() {
                 onChange={(e) => setRemark(e.target.value)}
               />
             </div>
+
+            <div className="border-2 border-black rounded-xl p-3 bg-gray-50">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold">Time Slots</div>
+                <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={addSlot}>
+                  + Add slot
+                </button>
+              </div>
+              <div className="text-xs text-gray-700 mt-1">Each slot can have its own time range, task selection, and assigned people.</div>
+            </div>
           </div>
 
           <div className="space-y-3">
-            <div className="text-sm font-semibold">Marshal Approved (select users + role)</div>
-
-            <div className="max-h-56 overflow-auto border-2 border-black rounded p-2 bg-gray-50 space-y-2">
-              {users.map((u) => {
-                const checked = selectedUserIds.includes(u.id);
-                const currentRole = roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
-                return (
-                  <div key={u.id} className="flex items-center justify-between gap-2 bg-white border-2 border-black rounded px-2 py-2">
-                    <label className="flex items-center gap-2 text-sm text-gray-900">
-                      <input type="checkbox" checked={checked} onChange={() => toggleUser(u)} />
-                      <span className="font-medium">{u.name}</span>
-                    </label>
-
-                    <select
-                      className="border-2 border-black rounded px-2 py-1 text-sm bg-white text-gray-900"
-                      disabled={!checked}
-                      value={currentRole}
-                      onChange={(e) => setRoleByUserId((prev) => ({ ...prev, [u.id]: e.target.value as WorkRole }))}
-                    >
-                      {workRoleOptions.map((r) => (
-                        <option key={r} value={r}>
-                          {WORK_ROLE_LABEL[r]}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="text-sm font-semibold">Pay Amount (default → editable)</div>
-            <div className="border-2 border-black rounded overflow-hidden bg-white">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="text-left p-2">User</th>
-                    <th className="text-left p-2">Role</th>
-                    <th className="text-right p-2">Default (RM)</th>
-                    <th className="text-right p-2">Override (RM)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {preview.map((p) => (
-                    <tr key={p.user.id} className="border-t bg-white">
-                      <td className="p-2 text-gray-900">{p.user.name}</td>
-                      <td className="p-2 text-xs text-gray-900">{WORK_ROLE_LABEL[p.workRole]}</td>
-                      <td className="p-2 text-right text-gray-900">{Number.isFinite(p.defaultRM) ? p.defaultRM.toFixed(2) : "0.00"}</td>
-                      <td className="p-2 text-right">
-                        <input
-                          className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
-                          placeholder="(auto)"
-                          value={overrides[p.user.id] ?? ""}
-                          onChange={(e) => setOverrides((prev) => ({ ...prev, [p.user.id]: e.target.value }))}
-                        />
-                      </td>
-                    </tr>
-                  ))}
-                  {preview.length === 0 && (
-                    <tr>
-                      <td className="p-3 text-gray-700" colSpan={4}>
-                        Select task + date(s) + users to preview default pay
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
             <button className="w-full rounded bg-black text-white py-2 hover:opacity-90 border-2 border-black" onClick={createOrUpdateEvent}>
               {editingEventId ? "Save Changes" : "Create Approved OT"}
             </button>
+            <div className="text-xs text-gray-700">
+              Rules: at least <b>1 slot</b>; each slot must have <b>date/time</b> and at least <b>1 user</b>.
+            </div>
           </div>
+        </div>
+
+        {/* Slots editor */}
+        <div className="space-y-4">
+          {slots.map((sl) => {
+            const multi = isMultiDayClaim(sl.selection.claim ?? null);
+            const preview = getSlotPreview(sl);
+
+            return (
+              <div key={sl.tempId} className="border-2 border-black rounded-xl overflow-hidden">
+                <div className="p-3 border-b-2 border-black flex items-start justify-between gap-3 bg-white">
+                  <div className="min-w-0">
+                    <div className="font-semibold">Slot #{sl.index + 1}</div>
+                    <div className="text-xs text-gray-700 mt-1">{slotSelectionSummary(sl.selection)}</div>
+                  </div>
+
+                  <div className="flex gap-2 shrink-0">
+                    <button
+                      type="button"
+                      className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900"
+                      onClick={() => openSlotModal(sl.tempId)}
+                    >
+                      Select tasks
+                    </button>
+                    <button
+                      type="button"
+                      className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-red-600 disabled:opacity-60"
+                      disabled={slots.length <= 1}
+                      onClick={() => removeSlot(sl.tempId)}
+                      title={slots.length <= 1 ? "At least one slot is required" : "Remove this slot"}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-4 grid md:grid-cols-2 gap-4 bg-white">
+                  {/* Slot time */}
+                  <div className="space-y-3">
+                    {!multi ? (
+                      <div>
+                        <label className="text-sm font-semibold">Date</label>
+                        <input
+                          className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                          type="date"
+                          value={sl.date}
+                          onChange={(e) => updateSlot(sl.tempId, { date: e.target.value })}
+                        />
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                          <label className="text-sm font-semibold">Start Date</label>
+                          <input
+                            className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                            type="date"
+                            value={sl.date}
+                            onChange={(e) => updateSlot(sl.tempId, { date: e.target.value })}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-sm font-semibold">End Date</label>
+                          <input
+                            className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                            type="date"
+                            value={sl.endDate}
+                            min={sl.date || undefined}
+                            onChange={(e) => updateSlot(sl.tempId, { endDate: e.target.value })}
+                          />
+                        </div>
+                        <div className="md:col-span-2 text-xs text-gray-700">
+                          For <b>2D1N</b> / <b>3D2N</b>, pick both start & end dates.
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-sm font-semibold">Start Time</label>
+                        <input
+                          className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                          type="time"
+                          value={sl.startTime}
+                          onChange={(e) => updateSlot(sl.tempId, { startTime: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-sm font-semibold">End Time</label>
+                        <input
+                          className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                          type="time"
+                          value={sl.endTime}
+                          onChange={(e) => updateSlot(sl.tempId, { endTime: e.target.value })}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Slot assignment */}
+                  <div className="space-y-3">
+                    <div className="text-sm font-semibold">Assign Users (this slot)</div>
+
+                    <div className="max-h-56 overflow-auto border-2 border-black rounded p-2 bg-gray-50 space-y-2">
+                      {users.map((u) => {
+                        const checked = sl.selectedUserIds.includes(u.id);
+                        const currentRole = sl.roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
+                        return (
+                          <div key={u.id} className="flex items-center justify-between gap-2 bg-white border-2 border-black rounded px-2 py-2">
+                            <label className="flex items-center gap-2 text-sm text-gray-900">
+                              <input type="checkbox" checked={checked} onChange={() => toggleUserInSlot(sl.tempId, u)} />
+                              <span className="font-medium">{u.name}</span>
+                            </label>
+
+                            <select
+                              className="border-2 border-black rounded px-2 py-1 text-sm bg-white text-gray-900"
+                              disabled={!checked}
+                              value={currentRole}
+                              onChange={(e) =>
+                                updateSlot(sl.tempId, {
+                                  roleByUserId: { ...sl.roleByUserId, [u.id]: e.target.value as WorkRole },
+                                })
+                              }
+                            >
+                              {workRoleOptions.map((r) => (
+                                <option key={r} value={r}>
+                                  {WORK_ROLE_LABEL[r]}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="text-sm font-semibold">Pay Amount (default → editable)</div>
+                    <div className="border-2 border-black rounded overflow-hidden bg-white">
+                      <table className="w-full text-sm">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="text-left p-2">User</th>
+                            <th className="text-left p-2">Role</th>
+                            <th className="text-right p-2">Default (RM)</th>
+                            <th className="text-right p-2">Override (RM)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {preview.map((p) => (
+                            <tr key={p.user.id} className="border-t bg-white">
+                              <td className="p-2 text-gray-900">{p.user.name}</td>
+                              <td className="p-2 text-xs text-gray-900">{WORK_ROLE_LABEL[p.workRole]}</td>
+                              <td className="p-2 text-right text-gray-900">{Number.isFinite(p.defaultRM) ? p.defaultRM.toFixed(2) : "0.00"}</td>
+                              <td className="p-2 text-right">
+                                <input
+                                  className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
+                                  placeholder="(auto)"
+                                  value={sl.overrides[p.user.id] ?? ""}
+                                  onChange={(e) =>
+                                    updateSlot(sl.tempId, {
+                                      overrides: { ...sl.overrides, [p.user.id]: e.target.value },
+                                    })
+                                  }
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                          {preview.length === 0 && (
+                            <tr>
+                              <td className="p-3 text-gray-700" colSpan={4}>
+                                Select task + date(s) + users to preview default pay
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      <TaskModal open={modalOpen} onClose={() => setModalOpen(false)} selection={selection} setSelection={setSelection} />
+      {/* Task modal */}
+      <TaskModal
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        selection={activeSlot?.selection || newEmptySelection()}
+        setSelection={(sel) => {
+          if (!activeSlotTempId) return;
+          updateSlot(activeSlotTempId, { selection: sel });
+        }}
+      />
 
+      {/* Existing events */}
       <div className="space-y-3">
         <div className="text-lg font-semibold">Existing Approved OT</div>
 
         {events.map((ev) => {
-          const sel = safeParseSelection(ev.taskCodes || "{}");
-
-          const s = new Date(ev.startTime);
-          const e = new Date(ev.endTime);
-          const startDateLabel = s.toLocaleDateString();
-          const endDateLabel = e.toLocaleDateString();
-          const sameDay = startDateLabel === endDateLabel;
-
-          const dateLabel = sameDay ? startDateLabel : `${startDateLabel} → ${endDateLabel}`;
-          const titleLeft = `${dateLabel} — ${ev.project}`;
-
-          const timeRange = sameDay
-            ? `${toLocalTime(s)} - ${toLocalTime(e)}`
-            : `${startDateLabel} ${toLocalTime(s)} - ${endDateLabel} ${toLocalTime(e)}`;
-
-          const selSummary = [
-            sel.claim ? CLAIM_LABEL[sel.claim] : "None",
-            sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
-            sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
-            sel.note ? `Note: ${sel.note}` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ");
+          const sortedSlots = (ev.slots || []).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 
           return (
             <div key={ev.id} className="bg-white border-2 border-black rounded-xl overflow-hidden">
               <div className="p-4 border-b-2 border-black flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
                 <div className="text-gray-900">
-                  <div className="font-semibold">{titleLeft}</div>
-                  <div className="text-xs text-gray-700">{timeRange}</div>
-                  <div className="text-xs text-gray-900 mt-1">{selSummary}</div>
+                  <div className="font-semibold">{ev.project}</div>
                   {ev.remark && <div className="text-xs text-gray-700 mt-1">Remark: {ev.remark}</div>}
+                  <div className="text-xs text-gray-700 mt-1">Slots: {sortedSlots.length}</div>
                 </div>
 
                 <div className="flex gap-2">
@@ -1143,92 +1360,123 @@ export default function ApprovedOTAdminPage() {
                 </div>
               </div>
 
-              <div className="p-4">
-                <div className="text-sm font-semibold mb-2">Assignments</div>
-                <div className="border-2 border-black rounded overflow-hidden bg-white">
-                  <table className="w-full text-sm">
-                    <thead className="bg-gray-50">
-                      <tr>
-                        <th className="text-left p-2">User</th>
-                        <th className="text-left p-2">Role</th>
-                        <th className="text-left p-2">Task & Pay</th>
-                        <th className="text-right p-2">Default</th>
-                        <th className="text-right p-2">Override</th>
-                        <th className="text-center p-2">Paid</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {ev.assignments.map((a) => {
-                        const isPaid = a.status === "PAID";
-                        const defaultCents = Number(a.amountDefault ?? 0);
-                        const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
-                        const effectiveCents = overrideCents ?? defaultCents;
+              <div className="p-4 space-y-4">
+                {sortedSlots.map((sl) => {
+                  const sel = safeParseSelection(sl.taskCodes || "{}");
+                  const s = new Date(sl.startTime);
+                  const e = new Date(sl.endTime);
 
-                        const breakdown = buildTaskPayBreakdown({
-                          workRole: a.workRole,
-                          start: s,
-                          end: e,
-                          selection: sel,
-                        });
+                  const dateLabel = isoDateOnly(s) === isoDateOnly(e)
+                    ? isoDateOnly(s)
+                    : `${isoDateOnly(s)} → ${isoDateOnly(e)}`;
 
-                        const inline = formatBreakdownInline(breakdown.lines);
+                  const timeRange = isoDateOnly(s) === isoDateOnly(e)
+                    ? `${toLocalTime(s)} - ${toLocalTime(e)}`
+                    : `${isoDateOnly(s)} ${toLocalTime(s)} - ${isoDateOnly(e)} ${toLocalTime(e)}`;
 
-                        return (
-                          <tr key={a.id} className={`border-t ${isPaid ? "bg-gray-100 text-gray-900" : "bg-white text-gray-900"}`}>
-                            <td className="p-2">{a.user.name}</td>
-                            <td className="p-2 text-xs">{WORK_ROLE_LABEL[a.workRole] || a.workRole}</td>
+                  const selSummary = [
+                    sel.claim ? CLAIM_LABEL[sel.claim] : "None",
+                    sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
+                    sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
+                    sel.note ? `Note: ${sel.note}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ");
 
-                            <td className="p-2 text-xs min-w-[280px]">
-                              <div className="text-gray-900">{inline}</div>
-                              <div className="text-[11px] text-gray-700 mt-1">Breakdown total: RM{breakdown.totalRM.toFixed(2)}</div>
-                            </td>
+                  return (
+                    <div key={sl.id} className="border-2 border-black rounded-xl overflow-hidden">
+                      <div className="p-3 border-b-2 border-black bg-gray-50">
+                        <div className="font-semibold">Slot #{(sl.index ?? 0) + 1} — {dateLabel}</div>
+                        <div className="text-xs text-gray-700">{timeRange}</div>
+                        <div className="text-xs text-gray-900 mt-1">{selSummary}</div>
+                      </div>
 
-                            <td className="p-2 text-right">RM{centsToRm(defaultCents)}</td>
-                            <td className="p-2 text-right">
-                              <input
-                                className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400 disabled:opacity-60"
-                                defaultValue={overrideCents !== null && Number.isFinite(overrideCents) ? (overrideCents / 100).toFixed(2) : ""}
-                                disabled={isPaid}
-                                placeholder="(none)"
-                                onBlur={(e) =>
-                                  patchAssignment(a.id, {
-                                    amountOverrideRM: e.target.value === "" ? null : e.target.value,
-                                  })
-                                }
-                              />
-                            </td>
-                            <td className="p-2 text-center">
-                              <input
-                                type="checkbox"
-                                checked={isPaid}
-                                onChange={(e) => patchAssignment(a.id, { status: e.target.checked ? "PAID" : "UNPAID" })}
-                              />
-                              <div className="text-xs mt-1">RM{centsToRm(effectiveCents)}</div>
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      <div className="p-3">
+                        <div className="text-sm font-semibold mb-2">Assignments</div>
+                        <div className="border-2 border-black rounded overflow-hidden bg-white">
+                          <table className="w-full text-sm">
+                            <thead className="bg-gray-50">
+                              <tr>
+                                <th className="text-left p-2">User</th>
+                                <th className="text-left p-2">Role</th>
+                                <th className="text-left p-2">Task & Pay</th>
+                                <th className="text-right p-2">Default</th>
+                                <th className="text-right p-2">Override</th>
+                                <th className="text-center p-2">Paid</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(sl.assignments || []).map((a) => {
+                                const isPaid = a.status === "PAID";
+                                const defaultCents = Number(a.amountDefault ?? 0);
+                                const overrideCents = a.amountOverride === null ? null : Number(a.amountOverride);
+                                const effectiveCents = overrideCents ?? defaultCents;
 
-                      {ev.assignments.length === 0 && (
-                        <tr>
-                          <td className="p-3 text-gray-700" colSpan={6}>
-                            No assignments
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+                                const breakdown = buildTaskPayBreakdown({
+                                  workRole: a.workRole,
+                                  start: s,
+                                  end: e,
+                                  selection: sel,
+                                });
+
+                                const inline = formatBreakdownInline(breakdown.lines);
+
+                                return (
+                                  <tr key={a.id} className={`border-t ${isPaid ? "bg-gray-100 text-gray-900" : "bg-white text-gray-900"}`}>
+                                    <td className="p-2">{a.user.name}</td>
+                                    <td className="p-2 text-xs">{WORK_ROLE_LABEL[a.workRole] || a.workRole}</td>
+
+                                    <td className="p-2 text-xs min-w-[280px]">
+                                      <div className="text-gray-900">{inline}</div>
+                                      <div className="text-[11px] text-gray-700 mt-1">Breakdown total: RM{breakdown.totalRM.toFixed(2)}</div>
+                                    </td>
+
+                                    <td className="p-2 text-right">RM{centsToRm(defaultCents)}</td>
+                                    <td className="p-2 text-right">
+                                      <input
+                                        className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400 disabled:opacity-60"
+                                        defaultValue={overrideCents !== null && Number.isFinite(overrideCents) ? (overrideCents / 100).toFixed(2) : ""}
+                                        disabled={isPaid}
+                                        placeholder="(none)"
+                                        onBlur={(e) =>
+                                          patchAssignment(a.id, {
+                                            amountOverrideRM: e.target.value === "" ? null : e.target.value,
+                                          })
+                                        }
+                                      />
+                                    </td>
+                                    <td className="p-2 text-center">
+                                      <input
+                                        type="checkbox"
+                                        checked={isPaid}
+                                        onChange={(e) => patchAssignment(a.id, { status: e.target.checked ? "PAID" : "UNPAID" })}
+                                      />
+                                      <div className="text-xs mt-1">RM{centsToRm(effectiveCents)}</div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+
+                              {(sl.assignments || []).length === 0 && (
+                                <tr>
+                                  <td className="p-3 text-gray-700" colSpan={6}>
+                                    No assignments
+                                  </td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           );
         })}
 
         {events.length === 0 && <div className="text-sm text-gray-700">No Approved OT yet.</div>}
-      </div>
-
-      <div className="text-xs text-gray-700">
-        Note: For Edit/Delete to work, you must add API routes: <code className="ml-1">/api/admin/ot-events/[id]</code> with PATCH + DELETE.
       </div>
     </div>
   );
