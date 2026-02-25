@@ -13,17 +13,17 @@ const WORK_ROLES: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCE
 const CLAIMS: (ClaimCode | null)[] = [null, "EVENT_HOURLY", "EVENT_HALF_DAY", "EVENT_FULL_DAY", "EVENT_2D1N", "EVENT_3D2N"];
 const TASK_CODES: TaskCode[] = ["BACKEND_RM15", "EVENT_AFTER_6PM", "EARLY_CALLING_RM30", "LOADING_UNLOADING_RM30"];
 
-function isWorkRole(x: unknown): x is WorkRole {
-  return WORK_ROLES.includes(x as WorkRole);
+function isWorkRole(x: any): x is WorkRole {
+  return WORK_ROLES.includes(x);
 }
-function isClaim(x: unknown): x is ClaimCode | null {
-  return CLAIMS.includes(x as any);
+function isClaim(x: any): x is ClaimCode | null {
+  return CLAIMS.includes(x);
 }
-function isTaskCode(x: unknown): x is TaskCode {
-  return TASK_CODES.includes(x as TaskCode);
+function isTaskCode(x: any): x is TaskCode {
+  return TASK_CODES.includes(x);
 }
 
-function safeNumber(v: unknown): number | null {
+function safeNumber(v: any): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string") {
     const n = Number(v);
@@ -32,42 +32,9 @@ function safeNumber(v: unknown): number | null {
   return null;
 }
 
-function parseDateInput(date: unknown): Date | null {
-  if (typeof date !== "string") return null;
-  const iso = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (iso) {
-    const d = new Date(`${iso[1]}-${iso[2]}-${iso[3]}T00:00:00`);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
-  const d = new Date(date);
+function toDate(x: any): Date | null {
+  const d = new Date(x);
   return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function toDate(x: unknown): Date | null {
-  const d = new Date(x as any);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/**
- * Validate important bits only, keep the rest.
- */
-function parseSelection(input: unknown): TaskSelection | null {
-  if (!input || typeof input !== "object") return null;
-
-  const obj = input as any;
-  const claim = obj.claim ?? null;
-  const codes = Array.isArray(obj.codes) ? obj.codes : [];
-
-  if (!isClaim(claim)) return null;
-  if (!codes.every(isTaskCode)) return null;
-
-  return { ...obj, claim, codes } as TaskSelection;
-}
-
-async function requireAdmin() {
-  const session = await getServerSession(authOptions);
-  if (!session || (session.user as any)?.role !== "ADMIN") return null;
-  return session;
 }
 
 function normalizeId(id: unknown): string | null {
@@ -76,189 +43,261 @@ function normalizeId(id: unknown): string | null {
   return v ? v : null;
 }
 
-type SyncAssignment = { userId: string; workRole: unknown };
-
 /**
- * Recompute assignment amountDefault for a given event time/selection/role.
- * Note: status/paidAt not touched here.
+ * Validate important bits only, keep the rest.
  */
-async function recomputeAllAssignmentsForEvent(args: {
-  eventId: string;
-  start: Date;
-  end: Date;
-  selection: TaskSelection;
-  overrides?: Record<string, unknown> | null;
-  assignments?: SyncAssignment[] | null;
-}) {
-  const { eventId, start, end, selection, overrides, assignments } = args;
+function parseSelection(input: any): TaskSelection | null {
+  if (!input || typeof input !== "object") return null;
 
-  const existing = await prisma.otAssignment.findMany({
-    where: { otEventId: eventId },
-    select: { id: true, userId: true, workRole: true, status: true, amountOverride: true },
-  });
+  if (!isClaim(input.claim ?? null)) return null;
 
-  const syncList = Array.isArray(assignments) ? assignments : null;
+  const codes = Array.isArray(input.codes) ? input.codes : [];
+  if (!codes.every(isTaskCode)) return null;
 
-  if (syncList) {
-    // ---- normalize + dedup WITHOUT filter(any) (strict TS safe) ----
+  return { ...input, claim: input.claim ?? null, codes } as TaskSelection;
+}
+
+async function requireAdmin() {
+  const session = await getServerSession(authOptions);
+  if (!session || (session.user as any)?.role !== "ADMIN") return null;
+  return session;
+}
+
+type SlotPatchInput = {
+  id?: string;
+  index?: number;
+  startTime: string;
+  endTime: string;
+  selection: any;
+  assignments: { userId: string; workRole: any }[];
+  overrides?: Record<string, any> | null;
+};
+
+function parseSlots(body: any): SlotPatchInput[] | null {
+  const slotsRaw = body?.slots;
+  if (!Array.isArray(slotsRaw) || slotsRaw.length === 0) return null;
+
+  const out: SlotPatchInput[] = [];
+  for (let i = 0; i < slotsRaw.length; i++) {
+    const s = slotsRaw[i];
+
+    const start = toDate(s?.startTime);
+    const end = toDate(s?.endTime);
+    if (!start || !end) return null;
+    if (!(end.getTime() > start.getTime())) return null;
+
+    const sel = parseSelection(s?.selection);
+    if (!sel) return null;
+
+    const assignments = Array.isArray(s?.assignments) ? s.assignments : [];
+    if (assignments.length === 0) return null;
+
     const seen = new Set<string>();
-    const normalized: SyncAssignment[] = [];
+    const normalizedAssignments = assignments
+      .map((a: any) => ({ userId: normalizeId(a?.userId), workRole: a?.workRole }))
+      .filter((a: any) => a.userId && !seen.has(a.userId) && (seen.add(a.userId), true));
 
-    for (const item of syncList) {
-      const uid = String(item?.userId || "").trim();
-      if (!uid) continue;
-      if (seen.has(uid)) continue;
-      seen.add(uid);
-      normalized.push({ userId: uid, workRole: item?.workRole });
-    }
+    if (normalizedAssignments.length === 0) return null;
 
-    const ids = normalized.map((x) => x.userId);
+    const slotId = typeof s?.id === "string" && s.id.trim() ? s.id.trim() : undefined;
 
-    const users = await prisma.user.findMany({
-      where: { id: { in: ids } },
-      select: { id: true, active: true, defaultWorkRole: true },
-    });
-
-    const found = new Map(users.map((u) => [u.id, u]));
-    const missing = ids.filter((id) => !found.has(id));
-    if (missing.length) throw new Error(`Unknown userIds: ${missing.join(", ")}`);
-
-    // delete assignments removed from list
-    const keepIds = new Set(ids);
-    const toDelete = existing.filter((a) => !keepIds.has(a.userId)).map((a) => a.id);
-    if (toDelete.length) {
-      await prisma.otAssignment.deleteMany({ where: { id: { in: toDelete } } });
-    }
-
-    // upsert each selected user assignment
-    for (const x of normalized) {
-      const u = found.get(x.userId)!;
-      if (!u.active) continue;
-
-      const rolePicked = isWorkRole(x.workRole) ? (x.workRole as WorkRole) : u.defaultWorkRole;
-      if (!isWorkRole(rolePicked)) continue;
-
-      const defaultRM = computeDefaultPayRM({ workRole: rolePicked, start, end, selection });
-      const amountDefault = rmToCents(defaultRM);
-
-      const raw = overrides?.[x.userId];
-      const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
-      const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
-
-      const existRow = existing.find((a) => a.userId === x.userId);
-      if (!existRow) {
-        await prisma.otAssignment.create({
-          data: {
-            otEventId: eventId,
-            userId: x.userId,
-            workRole: rolePicked,
-            amountDefault,
-            amountOverride,
-          },
-        });
-      } else {
-        await prisma.otAssignment.update({
-          where: { id: existRow.id },
-          data: {
-            workRole: rolePicked,
-            amountDefault,
-            amountOverride,
-          },
-        });
-      }
-    }
-
-    return;
-  }
-
-  // No syncList: recompute amountDefault for existing assignments (role stays same).
-  for (const a of existing) {
-    const rolePicked = a.workRole;
-    if (!isWorkRole(rolePicked)) continue;
-
-    const defaultRM = computeDefaultPayRM({ workRole: rolePicked, start, end, selection });
-    const amountDefault = rmToCents(defaultRM);
-
-    let amountOverride: number | null = a.amountOverride ?? null;
-    if (overrides && Object.prototype.hasOwnProperty.call(overrides, a.userId)) {
-      const raw = overrides?.[a.userId];
-      const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
-      amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
-    }
-
-    await prisma.otAssignment.update({
-      where: { id: a.id },
-      data: { amountDefault, amountOverride },
+    out.push({
+      id: slotId,
+      index: typeof s?.index === "number" && Number.isFinite(s.index) ? s.index : i,
+      startTime: start.toISOString(),
+      endTime: end.toISOString(),
+      selection: sel,
+      assignments: normalizedAssignments as any,
+      overrides: s?.overrides && typeof s.overrides === "object" ? s.overrides : null,
     });
   }
+
+  return out;
 }
 
 /** ---------- handlers ---------- */
-export async function PATCH(req: Request, { params }: { params: { id: string } }) {
+export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
-  const id = normalizeId(params.id);
-  if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+  const { id: rawId } = await params;
+  const eventId = normalizeId(rawId);
+  if (!eventId) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
-    const body = (await req.json().catch(() => null)) as any;
-    const { date, project, taskNotes, startTime, endTime, remark, selection, overrides, assignments } = body || {};
+    const body = await req.json().catch(() => null);
 
-    const existing = await prisma.otEvent.findUnique({
-      where: { id },
-      select: { id: true, date: true, startTime: true, endTime: true, taskCodes: true },
+    const project = body?.project;
+    const remark = body?.remark;
+
+    const slotsInput = parseSlots(body);
+    if (!slotsInput) return NextResponse.json({ error: "Missing/invalid slots (need at least 1 slot)" }, { status: 400 });
+
+    // collect all userIds across slots
+    const allUserIds = Array.from(new Set(slotsInput.flatMap((s) => s.assignments.map((a) => String(a.userId)))));
+
+    const users = await prisma.user.findMany({
+      where: { id: { in: allUserIds } },
+      select: { id: true, active: true, defaultWorkRole: true },
     });
-    if (!existing) return NextResponse.json({ error: "Event not found" }, { status: 404 });
+    const found = new Map(users.map((u) => [u.id, u]));
+    const missing = allUserIds.filter((id) => !found.has(id));
+    if (missing.length) return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
 
-    const nextDate = date ? parseDateInput(date) : existing.date;
-    if (!nextDate) return NextResponse.json({ error: "Invalid date" }, { status: 400 });
+    // We use interactive transaction so slot+assignment sync stays consistent
+    await prisma.$transaction(async (tx) => {
+      const existingEvent = await tx.otEvent.findUnique({
+        where: { id: eventId },
+        select: { id: true },
+      });
+      if (!existingEvent) throw new Error("Event not found");
 
-    const nextStart = startTime ? toDate(startTime) : existing.startTime;
-    const nextEnd = endTime ? toDate(endTime) : existing.endTime;
-    if (!nextStart || !nextEnd) return NextResponse.json({ error: "Invalid startTime/endTime" }, { status: 400 });
+      const existingSlots = await tx.otSlot.findMany({
+        where: { otEventId: eventId },
+        select: { id: true },
+      });
+      const existingSlotIds = new Set(existingSlots.map((s) => s.id));
 
-    let selObj: TaskSelection | null = null;
-    if (selection) {
-      selObj = parseSelection(selection);
-    } else {
-      try {
-        selObj = parseSelection(JSON.parse(existing.taskCodes || "{}"));
-      } catch {
-        selObj = null;
+      // Upsert slots and keep mapping of payload -> real slot id
+      const keepIds = new Set<string>();
+      const payloadSorted = slotsInput.slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+      const resolvedSlots: { slotId: string; input: SlotPatchInput }[] = [];
+
+      for (let i = 0; i < payloadSorted.length; i++) {
+        const s = payloadSorted[i];
+        const start = new Date(s.startTime);
+        const end = new Date(s.endTime);
+        const sel = parseSelection(s.selection)!;
+
+        const idx = typeof s.index === "number" ? s.index : i;
+
+        // if slot id exists and belongs to this event -> update
+        if (s.id && existingSlotIds.has(s.id)) {
+          await tx.otSlot.update({
+            where: { id: s.id },
+            data: {
+              index: idx,
+              startTime: start,
+              endTime: end,
+              taskCodes: JSON.stringify(sel),
+            },
+          });
+          keepIds.add(s.id);
+          resolvedSlots.push({ slotId: s.id, input: s });
+        } else {
+          // create new slot
+          const created = await tx.otSlot.create({
+            data: {
+              otEventId: eventId,
+              index: idx,
+              startTime: start,
+              endTime: end,
+              taskCodes: JSON.stringify(sel),
+            },
+            select: { id: true },
+          });
+          keepIds.add(created.id);
+          resolvedSlots.push({ slotId: created.id, input: s });
+        }
       }
-    }
-    if (!selObj) return NextResponse.json({ error: "Invalid selection" }, { status: 400 });
 
-    await prisma.otEvent.update({
-      where: { id },
-      data: {
-        date: nextDate,
-        project: typeof project === "string" ? project : undefined,
-        taskNotes: taskNotes === undefined ? undefined : taskNotes || null,
-        startTime: nextStart,
-        endTime: nextEnd,
-        taskCodes: JSON.stringify(selObj),
-        remark: remark === undefined ? undefined : remark || null,
-      },
-    });
+      // delete removed slots (cascade deletes their assignments)
+      const toDelete = existingSlots.filter((s) => !keepIds.has(s.id)).map((s) => s.id);
+      if (toDelete.length) {
+        await tx.otSlot.deleteMany({ where: { id: { in: toDelete } } });
+      }
 
-    // normalize incoming sync list
-    let syncAssignments: SyncAssignment[] | null = null;
-    if (Array.isArray(assignments)) {
-      syncAssignments = assignments.map((a: any) => ({
-        userId: String(a?.userId || ""),
-        workRole: a?.workRole,
-      }));
-    }
+      // sync assignments per slot
+      for (const rs of resolvedSlots) {
+        const slotId = rs.slotId;
+        const input = rs.input;
 
-    await recomputeAllAssignmentsForEvent({
-      eventId: id,
-      start: nextStart,
-      end: nextEnd,
-      selection: selObj,
-      overrides: overrides && typeof overrides === "object" ? (overrides as Record<string, unknown>) : null,
-      assignments: syncAssignments,
+        const start = new Date(input.startTime);
+        const end = new Date(input.endTime);
+        const sel = parseSelection(input.selection)!;
+
+        const existingAssignments = await tx.otAssignment.findMany({
+          where: { otEventId: eventId, otSlotId: slotId },
+          select: { id: true, userId: true, workRole: true, status: true, amountOverride: true },
+        });
+        const existByUser = new Map(existingAssignments.map((a) => [a.userId, a]));
+
+        const desiredUserIds = new Set(input.assignments.map((a) => String(a.userId)));
+
+        // delete removed assignments
+        const removeIds = existingAssignments.filter((a) => !desiredUserIds.has(a.userId)).map((a) => a.id);
+        if (removeIds.length) {
+          await tx.otAssignment.deleteMany({ where: { id: { in: removeIds } } });
+        }
+
+        // upsert desired assignments
+        for (const a of input.assignments) {
+          const userId = String(a.userId);
+          const u = found.get(userId)!;
+          if (!u.active) continue;
+
+          const picked = isWorkRole(a.workRole) ? (a.workRole as WorkRole) : u.defaultWorkRole;
+          if (!isWorkRole(picked)) continue;
+
+          const rm = computeDefaultPayRM({ workRole: picked, start, end, selection: sel });
+          const amountDefault = rmToCents(rm);
+
+          const raw = (input.overrides || null)?.[userId];
+          const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
+          const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
+
+          const exist = existByUser.get(userId);
+
+          if (!exist) {
+            await tx.otAssignment.create({
+              data: {
+                otEventId: eventId,
+                otSlotId: slotId,
+                userId,
+                workRole: picked,
+                amountDefault,
+                amountOverride,
+              },
+            });
+          } else {
+            // keep status/paid fields untouched; update role/default/override
+            await tx.otAssignment.update({
+              where: { id: exist.id },
+              data: {
+                workRole: picked,
+                amountDefault,
+                amountOverride,
+              },
+            });
+          }
+        }
+      }
+
+      // update legacy fields on event (min/max + first slot taskCodes) + event-level project/remark
+      const latestSlots = await tx.otSlot.findMany({
+        where: { otEventId: eventId },
+        select: { id: true, startTime: true, endTime: true, taskCodes: true, index: true },
+        orderBy: [{ index: "asc" }, { startTime: "asc" }],
+      });
+      if (!latestSlots.length) throw new Error("Event must have at least 1 slot");
+
+      const minStart = new Date(Math.min(...latestSlots.map((s) => s.startTime.getTime())));
+      const maxEnd = new Date(Math.max(...latestSlots.map((s) => s.endTime.getTime())));
+      const eventDate = new Date(minStart);
+      eventDate.setHours(0, 0, 0, 0);
+
+      await tx.otEvent.update({
+        where: { id: eventId },
+        data: {
+          project: typeof project === "string" ? project : undefined,
+          remark: remark === undefined ? undefined : remark || null,
+
+          date: eventDate,
+          startTime: minStart,
+          endTime: maxEnd,
+          taskCodes: latestSlots[0].taskCodes, // legacy compat uses first slot
+        },
+      });
     });
 
     return NextResponse.json({ ok: true });
@@ -267,19 +306,20 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   }
 }
 
-export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
-  const id = normalizeId(params.id);
-  if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+  const { id: rawId } = await params;
+  const eventId = normalizeId(rawId);
+  if (!eventId) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
-    const ev = await prisma.otEvent.findUnique({ where: { id }, select: { id: true } });
+    const ev = await prisma.otEvent.findUnique({ where: { id: eventId }, select: { id: true } });
     if (!ev) return NextResponse.json({ error: "Event not found" }, { status: 404 });
 
-    await prisma.otAssignment.deleteMany({ where: { otEventId: id } });
-    await prisma.otEvent.delete({ where: { id } });
+    // cascade should handle slots + assignments (both relations have onDelete: Cascade)
+    await prisma.otEvent.delete({ where: { id: eventId } });
 
     return NextResponse.json({ ok: true });
   } catch (e: any) {
