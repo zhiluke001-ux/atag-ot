@@ -37,15 +37,10 @@ function toDate(x: any): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function normalizeId(id: unknown): string | null {
-  if (typeof id !== "string") return null;
-  const v = id.trim();
-  return v ? v : null;
+function utcDateOnlyFrom(d: Date) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
-/**
- * Validate important bits only, keep the rest.
- */
 function parseSelection(input: any): TaskSelection | null {
   if (!input || typeof input !== "object") return null;
 
@@ -63,244 +58,276 @@ async function requireAdmin() {
   return session;
 }
 
+function normalizeId(id: unknown): string | null {
+  if (typeof id !== "string") return null;
+  const v = id.trim();
+  return v ? v : null;
+}
+
 type SlotPatchInput = {
   id?: string;
   index?: number;
   startTime: string;
   endTime: string;
-  selection: any;
-  assignments: { userId: string; workRole: any }[];
-  overrides?: Record<string, any> | null;
+  selection?: any;
+  taskCodes?: string;
+  assignments?: { userId: string; workRole?: WorkRole; amountOverrideRM?: string | number | null }[];
 };
 
-function parseSlots(body: any): SlotPatchInput[] | null {
-  const slotsRaw = body?.slots;
-  if (!Array.isArray(slotsRaw) || slotsRaw.length === 0) return null;
-
-  const out: SlotPatchInput[] = [];
-  for (let i = 0; i < slotsRaw.length; i++) {
-    const s = slotsRaw[i];
-
-    const start = toDate(s?.startTime);
-    const end = toDate(s?.endTime);
-    if (!start || !end) return null;
-    if (!(end.getTime() > start.getTime())) return null;
-
-    const sel = parseSelection(s?.selection);
-    if (!sel) return null;
-
-    const assignments = Array.isArray(s?.assignments) ? s.assignments : [];
-    if (assignments.length === 0) return null;
-
-    const seen = new Set<string>();
-    const normalizedAssignments = assignments
-      .map((a: any) => ({ userId: normalizeId(a?.userId), workRole: a?.workRole }))
-      .filter((a: any) => a.userId && !seen.has(a.userId) && (seen.add(a.userId), true));
-
-    if (normalizedAssignments.length === 0) return null;
-
-    const slotId = typeof s?.id === "string" && s.id.trim() ? s.id.trim() : undefined;
-
-    out.push({
-      id: slotId,
-      index: typeof s?.index === "number" && Number.isFinite(s.index) ? s.index : i,
-      startTime: start.toISOString(),
-      endTime: end.toISOString(),
-      selection: sel,
-      assignments: normalizedAssignments as any,
-      overrides: s?.overrides && typeof s.overrides === "object" ? s.overrides : null,
-    });
+function parseSlotSelection(slot: any): TaskSelection | null {
+  if (slot?.selection) return parseSelection(slot.selection);
+  if (typeof slot?.taskCodes === "string") {
+    try {
+      return parseSelection(JSON.parse(slot.taskCodes || "{}"));
+    } catch {
+      return null;
+    }
   }
-
-  return out;
+  return null;
 }
 
-/** ---------- handlers ---------- */
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
   const { id: rawId } = await params;
-  const eventId = normalizeId(rawId);
-  if (!eventId) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+  const id = normalizeId(rawId);
+  if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
     const body = await req.json().catch(() => null);
+    const { project, taskNotes, remark, slots } = body || {};
 
-    const project = body?.project;
-    const remark = body?.remark;
-
-    const slotsInput = parseSlots(body);
-    if (!slotsInput) return NextResponse.json({ error: "Missing/invalid slots (need at least 1 slot)" }, { status: 400 });
-
-    // collect all userIds across slots
-    const allUserIds = Array.from(new Set(slotsInput.flatMap((s) => s.assignments.map((a) => String(a.userId)))));
-
-    const users = await prisma.user.findMany({
-      where: { id: { in: allUserIds } },
-      select: { id: true, active: true, defaultWorkRole: true },
-    });
-    const found = new Map(users.map((u) => [u.id, u]));
-    const missing = allUserIds.filter((id) => !found.has(id));
-    if (missing.length) return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
-
-    // We use interactive transaction so slot+assignment sync stays consistent
-    await prisma.$transaction(async (tx) => {
-      const existingEvent = await tx.otEvent.findUnique({
-        where: { id: eventId },
-        select: { id: true },
-      });
-      if (!existingEvent) throw new Error("Event not found");
-
-      const existingSlots = await tx.otSlot.findMany({
-        where: { otEventId: eventId },
-        select: { id: true },
-      });
-      const existingSlotIds = new Set(existingSlots.map((s) => s.id));
-
-      // Upsert slots and keep mapping of payload -> real slot id
-      const keepIds = new Set<string>();
-      const payloadSorted = slotsInput.slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-      const resolvedSlots: { slotId: string; input: SlotPatchInput }[] = [];
-
-      for (let i = 0; i < payloadSorted.length; i++) {
-        const s = payloadSorted[i];
-        const start = new Date(s.startTime);
-        const end = new Date(s.endTime);
-        const sel = parseSelection(s.selection)!;
-
-        const idx = typeof s.index === "number" ? s.index : i;
-
-        // if slot id exists and belongs to this event -> update
-        if (s.id && existingSlotIds.has(s.id)) {
-          await tx.otSlot.update({
-            where: { id: s.id },
-            data: {
-              index: idx,
-              startTime: start,
-              endTime: end,
-              taskCodes: JSON.stringify(sel),
-            },
-          });
-          keepIds.add(s.id);
-          resolvedSlots.push({ slotId: s.id, input: s });
-        } else {
-          // create new slot
-          const created = await tx.otSlot.create({
-            data: {
-              otEventId: eventId,
-              index: idx,
-              startTime: start,
-              endTime: end,
-              taskCodes: JSON.stringify(sel),
-            },
-            select: { id: true },
-          });
-          keepIds.add(created.id);
-          resolvedSlots.push({ slotId: created.id, input: s });
-        }
-      }
-
-      // delete removed slots (cascade deletes their assignments)
-      const toDelete = existingSlots.filter((s) => !keepIds.has(s.id)).map((s) => s.id);
-      if (toDelete.length) {
-        await tx.otSlot.deleteMany({ where: { id: { in: toDelete } } });
-      }
-
-      // sync assignments per slot
-      for (const rs of resolvedSlots) {
-        const slotId = rs.slotId;
-        const input = rs.input;
-
-        const start = new Date(input.startTime);
-        const end = new Date(input.endTime);
-        const sel = parseSelection(input.selection)!;
-
-        const existingAssignments = await tx.otAssignment.findMany({
-          where: { otEventId: eventId, otSlotId: slotId },
-          select: { id: true, userId: true, workRole: true, status: true, amountOverride: true },
-        });
-        const existByUser = new Map(existingAssignments.map((a) => [a.userId, a]));
-
-        const desiredUserIds = new Set(input.assignments.map((a) => String(a.userId)));
-
-        // delete removed assignments
-        const removeIds = existingAssignments.filter((a) => !desiredUserIds.has(a.userId)).map((a) => a.id);
-        if (removeIds.length) {
-          await tx.otAssignment.deleteMany({ where: { id: { in: removeIds } } });
-        }
-
-        // upsert desired assignments
-        for (const a of input.assignments) {
-          const userId = String(a.userId);
-          const u = found.get(userId)!;
-          if (!u.active) continue;
-
-          const picked = isWorkRole(a.workRole) ? (a.workRole as WorkRole) : u.defaultWorkRole;
-          if (!isWorkRole(picked)) continue;
-
-          const rm = computeDefaultPayRM({ workRole: picked, start, end, selection: sel });
-          const amountDefault = rmToCents(rm);
-
-          const raw = (input.overrides || null)?.[userId];
-          const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
-          const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
-
-          const exist = existByUser.get(userId);
-
-          if (!exist) {
-            await tx.otAssignment.create({
-              data: {
-                otEventId: eventId,
-                otSlotId: slotId,
-                userId,
-                workRole: picked,
-                amountDefault,
-                amountOverride,
+    // ✅ NEW: multi-slot update
+    if (Array.isArray(slots) && slots.length > 0) {
+      const existing = await prisma.otEvent.findUnique({
+        where: { id },
+        include: {
+          slots: {
+            include: {
+              assignments: {
+                select: {
+                  id: true,
+                  userId: true,
+                  status: true,
+                  workRole: true,
+                  amountDefault: true,
+                  amountOverride: true,
+                },
               },
-            });
-          } else {
-            // keep status/paid fields untouched; update role/default/override
-            await tx.otAssignment.update({
-              where: { id: exist.id },
-              data: {
-                workRole: picked,
-                amountDefault,
-                amountOverride,
-              },
-            });
-          }
-        }
-      }
-
-      // update legacy fields on event (min/max + first slot taskCodes) + event-level project/remark
-      const latestSlots = await tx.otSlot.findMany({
-        where: { otEventId: eventId },
-        select: { id: true, startTime: true, endTime: true, taskCodes: true, index: true },
-        orderBy: [{ index: "asc" }, { startTime: "asc" }],
-      });
-      if (!latestSlots.length) throw new Error("Event must have at least 1 slot");
-
-      const minStart = new Date(Math.min(...latestSlots.map((s) => s.startTime.getTime())));
-      const maxEnd = new Date(Math.max(...latestSlots.map((s) => s.endTime.getTime())));
-      const eventDate = new Date(minStart);
-      eventDate.setHours(0, 0, 0, 0);
-
-      await tx.otEvent.update({
-        where: { id: eventId },
-        data: {
-          project: typeof project === "string" ? project : undefined,
-          remark: remark === undefined ? undefined : remark || null,
-
-          date: eventDate,
-          startTime: minStart,
-          endTime: maxEnd,
-          taskCodes: latestSlots[0].taskCodes, // legacy compat uses first slot
+            },
+          },
         },
       });
-    });
+      if (!existing) return NextResponse.json({ error: "Event not found" }, { status: 404 });
 
-    return NextResponse.json({ ok: true });
+      if (typeof project !== "string" || !project.trim()) {
+        return NextResponse.json({ error: "Missing project" }, { status: 400 });
+      }
+
+      const parsedSlots: {
+        id?: string;
+        index: number;
+        start: Date;
+        end: Date;
+        selection: TaskSelection;
+        assignments: { userId: string; workRole?: WorkRole; amountOverrideRM?: any }[];
+      }[] = [];
+
+      for (let i = 0; i < slots.length; i++) {
+        const s: SlotPatchInput = slots[i];
+        const start = toDate(s?.startTime);
+        const end = toDate(s?.endTime);
+        if (!start || !end) return NextResponse.json({ error: `Invalid slot time at slot ${i + 1}` }, { status: 400 });
+        if (end.getTime() <= start.getTime()) return NextResponse.json({ error: `Slot endTime must be after startTime (slot ${i + 1})` }, { status: 400 });
+
+        const sel = parseSlotSelection(s);
+        if (!sel) return NextResponse.json({ error: `Invalid selection at slot ${i + 1}` }, { status: 400 });
+
+        const idx = Number.isFinite(Number(s?.index)) ? Number(s.index) : i;
+        const slotId = s?.id ? normalizeId(s.id) || undefined : undefined;
+
+        parsedSlots.push({
+          id: slotId,
+          index: idx,
+          start,
+          end,
+          selection: sel,
+          assignments: Array.isArray(s?.assignments) ? s.assignments : [],
+        });
+      }
+
+      // normalize indices by UI order (0..n-1)
+      parsedSlots.sort((a, b) => a.index - b.index);
+      parsedSlots.forEach((s, i) => (s.index = i));
+
+      const minStart = parsedSlots.reduce((m, s) => (s.start < m ? s.start : m), parsedSlots[0].start);
+      const maxEnd = parsedSlots.reduce((m, s) => (s.end > m ? s.end : m), parsedSlots[0].end);
+      const eventDate = utcDateOnlyFrom(minStart);
+
+      // gather all userIds across slots
+      const allUserIds: string[] = [];
+      for (const sl of parsedSlots) {
+        for (const a of sl.assignments || []) {
+          const uid = normalizeId(a?.userId);
+          if (uid) allUserIds.push(uid);
+        }
+      }
+      const uniqueUserIds = Array.from(new Set(allUserIds));
+      const users = uniqueUserIds.length
+        ? await prisma.user.findMany({
+            where: { id: { in: uniqueUserIds } },
+            select: { id: true, active: true, defaultWorkRole: true },
+          })
+        : [];
+      const found = new Map(users.map((u) => [u.id, u]));
+      const missing = uniqueUserIds.filter((x) => !found.has(x));
+      if (missing.length) return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
+
+      const existingSlotsById = new Map(existing.slots.map((s) => [s.id, s]));
+
+      await prisma.$transaction(async (tx) => {
+        // 1) Upsert slots
+        const keptSlotIds: string[] = [];
+        const slotIdByIndex = new Map<number, string>();
+
+        for (const sl of parsedSlots) {
+          if (sl.id && existingSlotsById.has(sl.id)) {
+            await tx.otSlot.update({
+              where: { id: sl.id },
+              data: {
+                index: sl.index,
+                startTime: sl.start,
+                endTime: sl.end,
+                taskCodes: JSON.stringify(sl.selection),
+              },
+            });
+            keptSlotIds.push(sl.id);
+            slotIdByIndex.set(sl.index, sl.id);
+          } else {
+            const createdSlot = await tx.otSlot.create({
+              data: {
+                otEventId: id,
+                index: sl.index,
+                startTime: sl.start,
+                endTime: sl.end,
+                taskCodes: JSON.stringify(sl.selection),
+              },
+              select: { id: true },
+            });
+            keptSlotIds.push(createdSlot.id);
+            slotIdByIndex.set(sl.index, createdSlot.id);
+
+            // patch local id so assignment sync can use it
+            sl.id = createdSlot.id;
+          }
+        }
+
+        // 2) Delete removed slots (cascade delete assignments)
+        const toDelete = existing.slots.filter((s) => !keptSlotIds.includes(s.id)).map((s) => s.id);
+        if (toDelete.length) {
+          await tx.otSlot.deleteMany({ where: { id: { in: toDelete } } });
+        }
+
+        // 3) Sync assignments per slot
+        for (const sl of parsedSlots) {
+          const slotId = sl.id || slotIdByIndex.get(sl.index);
+          if (!slotId) continue;
+
+          const existingSlot = existingSlotsById.get(slotId);
+          const existingAssignments = existingSlot?.assignments || [];
+
+          const existingByUser = new Map(existingAssignments.map((a) => [a.userId, a]));
+
+          // de-dup payload by userId
+          const seen = new Set<string>();
+          const normalizedAssigns = (sl.assignments || [])
+            .map((a) => ({
+              userId: normalizeId(a?.userId) || "",
+              workRole: a?.workRole,
+              amountOverrideRM: (a as any)?.amountOverrideRM,
+            }))
+            .filter((a) => a.userId && !seen.has(a.userId) && (seen.add(a.userId), true));
+
+          const keepUserIds = new Set(normalizedAssigns.map((a) => a.userId));
+
+          // remove UNPAID ones not in payload (keep PAID)
+          const removeIds = existingAssignments
+            .filter((a) => !keepUserIds.has(a.userId) && a.status !== "PAID")
+            .map((a) => a.id);
+
+          if (removeIds.length) {
+            await tx.otAssignment.deleteMany({ where: { id: { in: removeIds } } });
+          }
+
+          // upsert
+          for (const a of normalizedAssigns) {
+            const u = found.get(a.userId)!;
+            if (!u.active) continue;
+
+            const picked = isWorkRole(a.workRole) ? (a.workRole as WorkRole) : u.defaultWorkRole;
+            if (!isWorkRole(picked)) continue;
+
+            const rm = computeDefaultPayRM({ workRole: picked, start: sl.start, end: sl.end, selection: sl.selection });
+            const amountDefault = rmToCents(rm);
+
+            const raw = a.amountOverrideRM;
+            const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
+            const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
+
+            const existRow = existingByUser.get(a.userId);
+
+            if (!existRow) {
+              await tx.otAssignment.create({
+                data: {
+                  otEventId: id,
+                  otSlotId: slotId,
+                  userId: a.userId,
+                  workRole: picked,
+                  amountDefault,
+                  amountOverride,
+                },
+              });
+            } else {
+              // ✅ safety: do not mutate PAID rows automatically
+              if (existRow.status === "PAID") continue;
+
+              await tx.otAssignment.update({
+                where: { id: existRow.id },
+                data: {
+                  workRole: picked,
+                  amountDefault,
+                  amountOverride,
+                },
+              });
+            }
+          }
+        }
+
+        // 4) Update event (min/max time + legacy taskCodes from slot0)
+        const slot0 = parsedSlots[0];
+        await tx.otEvent.update({
+          where: { id },
+          data: {
+            date: eventDate,
+            project: project.trim(),
+            taskNotes: taskNotes === undefined ? undefined : taskNotes || null,
+            remark: remark === undefined ? undefined : remark || null,
+            startTime: minStart,
+            endTime: maxEnd,
+            taskCodes: JSON.stringify(slot0.selection),
+          },
+        });
+      });
+
+      return NextResponse.json({ ok: true });
+    }
+
+    // ✅ LEGACY PATCH (your old logic can stay, but simplest is reject if no slots)
+    return NextResponse.json(
+      { error: "This event expects slots[]. Please update using slots payload." },
+      { status: 400 }
+    );
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Internal error" }, { status: 500 });
   }
@@ -311,15 +338,17 @@ export async function DELETE(_req: Request, { params }: { params: Promise<{ id: 
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
   const { id: rawId } = await params;
-  const eventId = normalizeId(rawId);
-  if (!eventId) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+  const id = normalizeId(rawId);
+  if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
-    const ev = await prisma.otEvent.findUnique({ where: { id: eventId }, select: { id: true } });
+    const ev = await prisma.otEvent.findUnique({ where: { id }, select: { id: true } });
     if (!ev) return NextResponse.json({ error: "Event not found" }, { status: 404 });
 
-    // cascade should handle slots + assignments (both relations have onDelete: Cascade)
-    await prisma.otEvent.delete({ where: { id: eventId } });
+    // delete children first (slots cascade assignments too, but keep explicit delete for safety)
+    await prisma.otAssignment.deleteMany({ where: { otEventId: id } });
+    await prisma.otSlot.deleteMany({ where: { otEventId: id } });
+    await prisma.otEvent.delete({ where: { id } });
 
     return NextResponse.json({ ok: true });
   } catch (e: any) {
