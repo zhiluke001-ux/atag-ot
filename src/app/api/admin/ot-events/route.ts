@@ -37,10 +37,8 @@ function toDate(x: any): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function normalizeId(id: unknown): string | null {
-  if (typeof id !== "string") return null;
-  const v = id.trim();
-  return v ? v : null;
+function utcDateOnlyFrom(d: Date) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
 /**
@@ -63,67 +61,59 @@ async function requireAdmin() {
   return session;
 }
 
+function normalizeId(id: unknown): string | null {
+  if (typeof id !== "string") return null;
+  const v = id.trim();
+  return v ? v : null;
+}
+
+/** ---------- NEW: slots parsing ---------- */
 type SlotInput = {
   id?: string;
   index?: number;
   startTime: string;
   endTime: string;
-  selection: any;
-  assignments: { userId: string; workRole: any }[];
-  overrides?: Record<string, any> | null;
+  selection?: any;
+  taskCodes?: string; // allow compat
+  assignments?: { userId: string; workRole?: WorkRole; amountOverrideRM?: string | number | null }[];
 };
 
-function parseSlotsInput(body: any): SlotInput[] | null {
-  const slotsRaw = body?.slots;
-  if (!Array.isArray(slotsRaw) || slotsRaw.length === 0) return null;
-
-  const out: SlotInput[] = [];
-  for (let i = 0; i < slotsRaw.length; i++) {
-    const s = slotsRaw[i];
-    const start = toDate(s?.startTime);
-    const end = toDate(s?.endTime);
-    if (!start || !end) return null;
-    if (!(end.getTime() > start.getTime())) return null;
-
-    const sel = parseSelection(s?.selection);
-    if (!sel) return null;
-
-    const assignments = Array.isArray(s?.assignments) ? s.assignments : [];
-    if (assignments.length === 0) return null;
-
-    // de-dup by userId inside slot
-    const seen = new Set<string>();
-    const normalizedAssignments = assignments
-      .map((a: any) => ({ userId: normalizeId(a?.userId), workRole: a?.workRole }))
-      .filter((a: any) => a.userId && !seen.has(a.userId) && (seen.add(a.userId), true));
-
-    if (normalizedAssignments.length === 0) return null;
-
-    out.push({
-      id: typeof s?.id === "string" && s.id.trim() ? s.id.trim() : undefined,
-      index: typeof s?.index === "number" && Number.isFinite(s.index) ? s.index : i,
-      startTime: start.toISOString(),
-      endTime: end.toISOString(),
-      selection: sel,
-      assignments: normalizedAssignments as any,
-      overrides: s?.overrides && typeof s.overrides === "object" ? s.overrides : null,
-    });
+function parseSlotSelection(slot: any): TaskSelection | null {
+  if (slot?.selection) return parseSelection(slot.selection);
+  if (typeof slot?.taskCodes === "string") {
+    try {
+      return parseSelection(JSON.parse(slot.taskCodes || "{}"));
+    } catch {
+      return null;
+    }
   }
-
-  return out;
+  return null;
 }
 
-/** ---------- handlers ---------- */
 export async function GET() {
   const session = await requireAdmin();
   if (!session) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
-  const raw = await prisma.otEvent.findMany({
+  const events = await prisma.otEvent.findMany({
     orderBy: { date: "desc" },
     include: {
-      // new slots
+      // Keep event.assignments for legacy fallback (old events w/o slots)
+      assignments: {
+        select: {
+          id: true,
+          userId: true,
+          workRole: true,
+          status: true,
+          amountDefault: true,
+          amountOverride: true,
+          paidAt: true,
+          paidById: true,
+          user: { select: { name: true, email: true } },
+        },
+        orderBy: { user: { name: "asc" } },
+      },
       slots: {
-        orderBy: [{ index: "asc" }, { startTime: "asc" }],
+        orderBy: { index: "asc" },
         include: {
           assignments: {
             select: {
@@ -141,51 +131,7 @@ export async function GET() {
           },
         },
       },
-      // legacy assignments (only those not linked to a slot)
-      assignments: {
-        where: { otSlotId: null },
-        select: {
-          id: true,
-          userId: true,
-          workRole: true,
-          status: true,
-          amountDefault: true,
-          amountOverride: true,
-          paidAt: true,
-          paidById: true,
-          user: { select: { name: true, email: true } },
-        },
-        orderBy: { user: { name: "asc" } },
-      },
     },
-  });
-
-  // backfill old events: if no slots, return a pseudo-slot so UI can edit
-  const events = raw.map((ev) => {
-    const hasSlots = ev.slots && ev.slots.length > 0;
-    if (hasSlots) {
-      return {
-        ...ev,
-        // remove legacy assignments from top-level to avoid confusion
-        assignments: undefined,
-      };
-    }
-
-    const pseudoSlotId = `__legacy__${ev.id}`;
-    const pseudo = {
-      id: pseudoSlotId,
-      index: 0,
-      startTime: ev.startTime,
-      endTime: ev.endTime,
-      taskCodes: ev.taskCodes,
-      assignments: ev.assignments || [],
-    };
-
-    return {
-      ...ev,
-      slots: [pseudo],
-      assignments: undefined,
-    };
   });
 
   return NextResponse.json({ events });
@@ -209,105 +155,245 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json().catch(() => null);
-    const project = typeof body?.project === "string" ? body.project.trim() : "";
-    const remark = body?.remark ?? null;
+    const { project, taskNotes, remark, slots } = body || {};
 
-    if (!project) return NextResponse.json({ error: "Missing project" }, { status: 400 });
+    // ✅ NEW FLOW: multi-slot
+    if (Array.isArray(slots) && slots.length > 0) {
+      if (typeof project !== "string" || !project.trim()) {
+        return NextResponse.json({ error: "Missing project" }, { status: 400 });
+      }
 
-    const slotsInput = parseSlotsInput(body);
-    if (!slotsInput) return NextResponse.json({ error: "Missing/invalid slots (need at least 1 slot)" }, { status: 400 });
+      const parsedSlots: {
+        index: number;
+        start: Date;
+        end: Date;
+        selection: TaskSelection;
+        assignments: { userId: string; workRole?: WorkRole; amountOverrideRM?: any }[];
+      }[] = [];
 
-    // collect all userIds
-    const allUserIds = Array.from(
-      new Set(
-        slotsInput.flatMap((s) => (s.assignments || []).map((a) => String(a.userId)))
-      )
-    );
+      for (let i = 0; i < slots.length; i++) {
+        const s: SlotInput = slots[i];
+        const start = toDate(s?.startTime);
+        const end = toDate(s?.endTime);
+        if (!start || !end) return NextResponse.json({ error: `Invalid slot time at slot ${i + 1}` }, { status: 400 });
+        if (end.getTime() <= start.getTime()) return NextResponse.json({ error: `Slot endTime must be after startTime (slot ${i + 1})` }, { status: 400 });
 
+        const sel = parseSlotSelection(s);
+        if (!sel) return NextResponse.json({ error: `Invalid selection at slot ${i + 1}` }, { status: 400 });
+
+        const idx = Number.isFinite(Number(s?.index)) ? Number(s.index) : i;
+
+        parsedSlots.push({
+          index: idx,
+          start,
+          end,
+          selection: sel,
+          assignments: Array.isArray(s?.assignments) ? s.assignments : [],
+        });
+      }
+
+      // normalize indices by UI order (0..n-1)
+      parsedSlots.sort((a, b) => a.index - b.index);
+      parsedSlots.forEach((s, i) => (s.index = i));
+
+      const minStart = parsedSlots.reduce((m, s) => (s.start < m ? s.start : m), parsedSlots[0].start);
+      const maxEnd = parsedSlots.reduce((m, s) => (s.end > m ? s.end : m), parsedSlots[0].end);
+      const eventDate = utcDateOnlyFrom(minStart);
+
+      // gather all userIds across slots
+      const allUserIds: string[] = [];
+      for (const sl of parsedSlots) {
+        for (const a of sl.assignments || []) {
+          const uid = normalizeId(a?.userId);
+          if (uid) allUserIds.push(uid);
+        }
+      }
+      const uniqueUserIds = Array.from(new Set(allUserIds));
+      const users = uniqueUserIds.length
+        ? await prisma.user.findMany({
+            where: { id: { in: uniqueUserIds } },
+            select: { id: true, active: true, defaultWorkRole: true },
+          })
+        : [];
+      const found = new Map(users.map((u) => [u.id, u]));
+
+      // validate userIds exist
+      const missing = uniqueUserIds.filter((id) => !found.has(id));
+      if (missing.length) return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
+
+      const firstSel = parsedSlots[0].selection;
+
+      const createdId = await prisma.$transaction(async (tx) => {
+        // create event + slots (NO assignments nested)
+        const created = await tx.otEvent.create({
+          data: {
+            date: eventDate,
+            project: project.trim(),
+            taskNotes: taskNotes || null,
+            startTime: minStart,
+            endTime: maxEnd,
+            // legacy field (keep for backward compat): store slot0 selection
+            taskCodes: JSON.stringify(firstSel),
+            remark: remark || null,
+            createdById: adminId!,
+            slots: {
+              create: parsedSlots.map((sl) => ({
+                index: sl.index,
+                startTime: sl.start,
+                endTime: sl.end,
+                taskCodes: JSON.stringify(sl.selection),
+              })),
+            },
+          },
+          select: {
+            id: true,
+            slots: { select: { id: true, index: true } },
+          },
+        });
+
+        const slotIdByIndex = new Map(created.slots.map((s) => [s.index, s.id]));
+
+        const assignmentsData: any[] = [];
+
+        for (const sl of parsedSlots) {
+          const slotId = slotIdByIndex.get(sl.index);
+          if (!slotId) continue;
+
+          // de-dup inside slot by userId
+          const seen = new Set<string>();
+          const normalizedAssigns = (sl.assignments || [])
+            .map((a) => ({
+              userId: normalizeId(a?.userId) || "",
+              workRole: a?.workRole,
+              amountOverrideRM: (a as any)?.amountOverrideRM,
+            }))
+            .filter((a) => a.userId && !seen.has(a.userId) && (seen.add(a.userId), true));
+
+          for (const a of normalizedAssigns) {
+            const u = found.get(a.userId)!;
+            if (!u.active) continue;
+
+            const picked = isWorkRole(a.workRole) ? (a.workRole as WorkRole) : u.defaultWorkRole;
+            if (!isWorkRole(picked)) continue;
+
+            const rm = computeDefaultPayRM({ workRole: picked, start: sl.start, end: sl.end, selection: sl.selection });
+            const amountDefault = rmToCents(rm);
+
+            const raw = a.amountOverrideRM;
+            const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
+            const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
+
+            assignmentsData.push({
+              otEventId: created.id,
+              otSlotId: slotId,
+              userId: a.userId,
+              workRole: picked,
+              amountDefault,
+              amountOverride,
+            });
+          }
+        }
+
+        if (assignmentsData.length === 0) {
+          // No assignments at all -> rollback by throwing
+          throw new Error("No assignments created. Please assign at least 1 person in at least 1 slot.");
+        }
+
+        await tx.otAssignment.createMany({ data: assignmentsData });
+
+        return created.id;
+      });
+
+      return NextResponse.json({ ok: true, id: createdId });
+    }
+
+    // ✅ LEGACY FLOW (single slot) — keep old clients working
+    const { date, startTime, endTime, selection, overrides, assignments, userIds, workRoles } = body || {};
+    if (!date || !project || !startTime || !endTime) {
+      return NextResponse.json({ error: "Missing fields" }, { status: 400 });
+    }
+
+    const start = toDate(startTime);
+    const end = toDate(endTime);
+    if (!start || !end) return NextResponse.json({ error: "Invalid startTime/endTime" }, { status: 400 });
+
+    const sel = parseSelection(selection);
+    if (!sel) return NextResponse.json({ error: "Invalid selection" }, { status: 400 });
+
+    // normalize assignments
+    let normalized: { userId: string; workRole: WorkRole }[] = [];
+    if (Array.isArray(assignments) && assignments.length > 0) {
+      normalized = assignments.map((a: any) => ({ userId: String(a?.userId || ""), workRole: a?.workRole }));
+    } else if (Array.isArray(userIds) && userIds.length > 0) {
+      normalized = userIds.map((id: any) => ({ userId: String(id), workRole: workRoles?.[id] }));
+    } else {
+      return NextResponse.json({ error: "No users selected" }, { status: 400 });
+    }
+
+    // de-dup
+    const seen = new Set<string>();
+    normalized = normalized.filter((a) => {
+      if (!a.userId) return false;
+      if (seen.has(a.userId)) return false;
+      seen.add(a.userId);
+      return true;
+    });
+
+    const ids = normalized.map((a) => a.userId);
     const users = await prisma.user.findMany({
-      where: { id: { in: allUserIds } },
+      where: { id: { in: ids } },
       select: { id: true, active: true, defaultWorkRole: true },
     });
 
     const found = new Map(users.map((u) => [u.id, u]));
-    const missing = allUserIds.filter((id) => !found.has(id));
+    const missing = ids.filter((id) => !found.has(id));
     if (missing.length) return NextResponse.json({ error: `Unknown userIds: ${missing.join(", ")}` }, { status: 400 });
-
-    // compute event legacy min/max
-    const slotStarts = slotsInput.map((s) => new Date(s.startTime));
-    const slotEnds = slotsInput.map((s) => new Date(s.endTime));
-    const minStart = new Date(Math.min(...slotStarts.map((d) => d.getTime())));
-    const maxEnd = new Date(Math.max(...slotEnds.map((d) => d.getTime())));
-
-    const eventDate = new Date(minStart);
-    eventDate.setHours(0, 0, 0, 0);
-
-    const firstSelection = parseSelection(slotsInput[0].selection)!;
-
-    // build nested create for slots + assignments
-    const slotCreates = slotsInput
-      .slice()
-      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
-      .map((s, idx) => {
-        const sel = parseSelection(s.selection)!;
-        const start = new Date(s.startTime);
-        const end = new Date(s.endTime);
-
-        const assignmentsCreate = (s.assignments || []).map((a) => {
-          const userId = String(a.userId);
-          const u = found.get(userId)!;
-          if (!u.active) return null;
-
-          const picked = isWorkRole(a.workRole) ? (a.workRole as WorkRole) : u.defaultWorkRole;
-          if (!isWorkRole(picked)) return null;
-
-          const rm = computeDefaultPayRM({ workRole: picked, start, end, selection: sel });
-          const amountDefault = rmToCents(rm);
-
-          const raw = (s.overrides || null)?.[userId];
-          const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
-          const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
-
-          return {
-            otEventId: undefined, // will be linked via relation automatically
-            userId,
-            workRole: picked,
-            amountDefault,
-            amountOverride,
-          };
-        }).filter(Boolean) as any[];
-
-        if (assignmentsCreate.length === 0) {
-          // will be rejected later by prisma if empty; we error early
-          throw new Error("A slot has no active users to assign");
-        }
-
-        return {
-          index: typeof s.index === "number" ? s.index : idx,
-          startTime: start,
-          endTime: end,
-          taskCodes: JSON.stringify(sel),
-          assignments: {
-            create: assignmentsCreate,
-          },
-        };
-      });
 
     const created = await prisma.otEvent.create({
       data: {
-        date: eventDate,
+        date: utcDateOnlyFrom(start),
         project,
-        startTime: minStart,
-        endTime: maxEnd,
-        taskCodes: JSON.stringify(firstSelection), // legacy compat
+        taskNotes: taskNotes || null,
+        startTime: start,
+        endTime: end,
+        taskCodes: JSON.stringify(sel),
         remark: remark || null,
         createdById: adminId,
-        slots: {
-          create: slotCreates,
-        },
       },
       select: { id: true },
     });
+
+    const assignmentsData = normalized
+      .map((a) => {
+        const u = found.get(a.userId)!;
+        if (!u.active) return null;
+
+        const picked = isWorkRole(a.workRole) ? a.workRole : u.defaultWorkRole;
+        if (!isWorkRole(picked)) return null;
+
+        const rm = computeDefaultPayRM({ workRole: picked, start, end, selection: sel });
+        const amountDefault = rmToCents(rm);
+
+        const raw = overrides?.[a.userId];
+        const overrideRM = raw === "" || raw === null || raw === undefined ? null : safeNumber(raw);
+        const amountOverride = overrideRM === null ? null : rmToCents(overrideRM);
+
+        return {
+          otEventId: created.id,
+          userId: a.userId,
+          workRole: picked,
+          amountDefault,
+          amountOverride,
+        };
+      })
+      .filter(Boolean) as any[];
+
+    if (assignmentsData.length === 0) {
+      await prisma.otEvent.delete({ where: { id: created.id } });
+      return NextResponse.json({ error: "No active users to assign" }, { status: 400 });
+    }
+
+    await prisma.otAssignment.createMany({ data: assignmentsData });
 
     return NextResponse.json({ ok: true, id: created.id });
   } catch (e: any) {
