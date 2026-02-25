@@ -40,31 +40,32 @@ type OtSlot = {
   index: number;
   startTime: string; // ISO
   endTime: string; // ISO
-  taskCodes: string; // JSON string of TaskSelection
+  taskCodes: string;
   assignments: Assignment[];
 };
 
 type OtEvent = {
   id: string;
-  date: string; // legacy
+  date: string;
   project: string;
-  remark: string | null;
-  // legacy range kept in DB, but UI uses slots
   startTime: string;
   endTime: string;
   taskCodes: string;
+  remark: string | null;
+
+  // legacy + new
+  assignments: Assignment[]; // legacy fallback (old events without slots)
   slots: OtSlot[];
 };
 
-/* ---------------- Slot form state ---------------- */
+/* ---------------- Slot draft state (UI) ---------------- */
 
-type SlotForm = {
-  tempId: string; // stable key for UI
-  id?: string; // real slot id when editing; undefined for new slots
+type SlotDraft = {
+  id?: string; // when editing existing slot
   index: number;
 
   date: string; // YYYY-MM-DD
-  endDate: string; // YYYY-MM-DD (for 2D1N/3D2N)
+  endDate: string; // YYYY-MM-DD (for 2D1N/3D2N, else same as date)
   startTime: string; // HH:mm
   endTime: string; // HH:mm
 
@@ -72,7 +73,7 @@ type SlotForm = {
 
   selectedUserIds: string[];
   roleByUserId: Record<string, WorkRole>;
-  overrides: Record<string, string>; // RM string per user (override)
+  overrides: Record<string, string>; // RM as string
 };
 
 /* ---------------- Safe helpers ---------------- */
@@ -131,7 +132,7 @@ function safeParseSelection(taskCodes: string): TaskSelection {
   }
 }
 
-function newEmptySelection(): TaskSelection {
+function defaultSelection(): TaskSelection {
   return {
     claim: null,
     codes: [],
@@ -142,12 +143,12 @@ function newEmptySelection(): TaskSelection {
   } as TaskSelection;
 }
 
-function makeTempId() {
-  return `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+function combineDateTime(d: string, t: string) {
+  return new Date(`${d}T${t}:00`);
 }
 
-function isMultiDayClaim(claim: ClaimCode | null) {
-  return claim === "EVENT_2D1N" || claim === "EVENT_3D2N";
+function toLocalTime(d: Date) {
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 /* ---------------- Task + Pay breakdown (display + export) ---------------- */
@@ -265,10 +266,6 @@ function buildTaskPayBreakdown(args: {
 function formatBreakdownInline(lines: { label: string; amountRM: number }[]) {
   if (!lines?.length) return "-";
   return lines.map((x) => `${x.label} (RM${x.amountRM.toFixed(2)})`).join(" + ");
-}
-
-function toLocalTime(d: Date) {
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 /* ---------------- CSV Export helpers ---------------- */
@@ -592,69 +589,108 @@ export default function ApprovedOTAdminPage() {
   // export state
   const [exportBusy, setExportBusy] = useState(false);
 
-  // event-level form
+  // Event-level
   const [project, setProject] = useState("");
   const [remark, setRemark] = useState("");
-
-  // Edit mode
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
 
-  // slots form
-  const [slots, setSlots] = useState<SlotForm[]>([
+  // Slots
+  const [slots, setSlots] = useState<SlotDraft[]>([
     {
-      tempId: makeTempId(),
       index: 0,
       date: "",
       endDate: "",
       startTime: "18:00",
       endTime: "20:00",
-      selection: newEmptySelection(),
+      selection: defaultSelection(),
       selectedUserIds: [],
       roleByUserId: {},
       overrides: {},
     },
   ]);
 
-  // modal state (per-slot)
+  // Task modal (for a specific slot)
   const [modalOpen, setModalOpen] = useState(false);
-  const [activeSlotTempId, setActiveSlotTempId] = useState<string | null>(null);
+  const [activeSlotIndex, setActiveSlotIndex] = useState<number>(0);
 
-  function openSlotModal(slotTempId: string) {
-    setActiveSlotTempId(slotTempId);
-    setModalOpen(true);
-  }
+  const workRoleOptions: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCEE", "SENIOR_EMCEE"];
 
-  function combineDateTime(d: string, t: string) {
-    return new Date(`${d}T${t}:00`);
-  }
+  function ensureEndDateForSlot(s: SlotDraft): SlotDraft {
+    const isMultiDay = s.selection.claim === "EVENT_2D1N" || s.selection.claim === "EVENT_3D2N";
+    if (!s.date) return s;
 
-  function slotSelectionSummary(sel: TaskSelection) {
-    const parts: string[] = [];
-    parts.push(sel.claim ? CLAIM_LABEL[sel.claim] : "None");
-    const codes = (sel.codes ?? []) as TaskCode[];
-    if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
-    if (sel.custom?.enabled && (sel.custom as any)?.amount) {
-      parts.push(`Custom: ${(sel.custom as any).label || "Item"} (RM${(sel.custom as any).amount})`);
+    if (isMultiDay) {
+      const delta = s.selection.claim === "EVENT_3D2N" ? 2 : 1;
+      const desired = addDaysToIsoDate(s.date, delta);
+      if (!s.endDate || s.endDate === s.date) return { ...s, endDate: desired };
+      return s;
     }
-    if (sel.note) parts.push(`Note: ${sel.note}`);
-    return parts.join(" · ");
+
+    // normal: keep endDate = date
+    if (s.endDate !== s.date) return { ...s, endDate: s.date };
+    return s;
   }
 
-  function syncSlotEndDate(next: SlotForm): SlotForm {
-    const multi = isMultiDayClaim(next.selection.claim ?? null);
-    if (!next.date) return next;
+  function updateSlot(i: number, patch: Partial<SlotDraft>) {
+    setSlots((prev) => {
+      const next = [...prev];
+      const cur = next[i];
+      if (!cur) return prev;
 
-    if (multi) {
-      if (!next.endDate || next.endDate === next.date) {
-        const delta = next.selection.claim === "EVENT_3D2N" ? 2 : 1;
-        return { ...next, endDate: addDaysToIsoDate(next.date, delta) };
-      }
+      let merged = { ...cur, ...patch } as SlotDraft;
+      merged = ensureEndDateForSlot(merged);
+      next[i] = merged;
       return next;
-    }
+    });
+  }
 
-    // non-multi: keep endDate = date
-    if (next.endDate !== next.date) return { ...next, endDate: next.date };
-    return next;
+  function addSlot() {
+    setSlots((prev) => {
+      const nextIndex = prev.length;
+      return [
+        ...prev,
+        {
+          index: nextIndex,
+          date: "",
+          endDate: "",
+          startTime: "18:00",
+          endTime: "20:00",
+          selection: defaultSelection(),
+          selectedUserIds: [],
+          roleByUserId: {},
+          overrides: {},
+        },
+      ];
+    });
+  }
+
+  function removeSlot(i: number) {
+    setSlots((prev) => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((_, idx) => idx !== i).map((s, idx) => ({ ...s, index: idx }));
+      return next;
+    });
+    if (activeSlotIndex === i) {
+      setActiveSlotIndex(0);
+    }
+  }
+
+  function toggleUserInSlot(slotIdx: number, u: User) {
+    updateSlot(slotIdx, {}); // ensure slot exists
+    setSlots((prev) => {
+      const next = [...prev];
+      const s = next[slotIdx];
+      if (!s) return prev;
+
+      const exists = s.selectedUserIds.includes(u.id);
+      const selectedUserIds = exists ? s.selectedUserIds.filter((x) => x !== u.id) : [...s.selectedUserIds, u.id];
+
+      const roleByUserId = { ...s.roleByUserId };
+      if (!roleByUserId[u.id]) roleByUserId[u.id] = u.defaultWorkRole || "JUNIOR_MARSHAL";
+
+      next[slotIdx] = { ...s, selectedUserIds, roleByUserId };
+      return next;
+    });
   }
 
   async function loadAll() {
@@ -676,22 +712,18 @@ export default function ApprovedOTAdminPage() {
     loadAll();
   }, []);
 
-  const workRoleOptions: WorkRole[] = ["JUNIOR_MARSHAL", "SENIOR_MARSHAL", "JUNIOR_EMCEE", "SENIOR_EMCEE"];
-
   function resetCreateForm() {
     setEditingEventId(null);
     setProject("");
     setRemark("");
-
     setSlots([
       {
-        tempId: makeTempId(),
         index: 0,
         date: "",
         endDate: "",
         startTime: "18:00",
         endTime: "20:00",
-        selection: newEmptySelection(),
+        selection: defaultSelection(),
         selectedUserIds: [],
         roleByUserId: {},
         overrides: {},
@@ -699,85 +731,107 @@ export default function ApprovedOTAdminPage() {
     ]);
   }
 
-  function addSlot() {
-    setSlots((prev) => {
-      const baseDate = prev[0]?.date || "";
-      const nextIndex = prev.length;
-      const s: SlotForm = {
-        tempId: makeTempId(),
-        index: nextIndex,
-        date: baseDate,
-        endDate: baseDate,
+  function normalizeEventSlots(ev: OtEvent): OtSlot[] {
+    if (ev.slots && ev.slots.length > 0) return ev.slots;
+    // legacy fallback: treat event as slot0
+    return [
+      {
+        id: `legacy-${ev.id}`,
+        index: 0,
+        startTime: ev.startTime,
+        endTime: ev.endTime,
+        taskCodes: ev.taskCodes,
+        assignments: ev.assignments || [],
+      },
+    ];
+  }
+
+  function fillFormFromEvent(ev: OtEvent) {
+    setEditingEventId(ev.id);
+    setProject(ev.project || "");
+    setRemark(ev.remark || "");
+
+    const evSlots = normalizeEventSlots(ev).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+
+    const drafts: SlotDraft[] = evSlots.map((sl, idx) => {
+      const sDate = isoDateOnly(new Date(sl.startTime));
+      const eDate = isoDateOnly(new Date(sl.endTime));
+      const sel = safeParseSelection(sl.taskCodes || "{}");
+
+      const selectedUserIds = (sl.assignments || []).map((a) => a.userId).filter(Boolean);
+      const roleByUserId: Record<string, WorkRole> = {};
+      const overrides: Record<string, string> = {};
+
+      for (const a of sl.assignments || []) {
+        roleByUserId[a.userId] = a.workRole;
+        if (a.amountOverride !== null && a.amountOverride !== undefined) {
+          overrides[a.userId] = (Number(a.amountOverride) / 100).toFixed(2);
+        }
+      }
+
+      const draft: SlotDraft = {
+        id: sl.id.startsWith("legacy-") ? undefined : sl.id,
+        index: idx,
+        date: sDate,
+        endDate: eDate,
+        startTime: hhmmFromIso(sl.startTime),
+        endTime: hhmmFromIso(sl.endTime),
+        selection: sel,
+        selectedUserIds,
+        roleByUserId,
+        overrides,
+      };
+
+      return ensureEndDateForSlot(draft);
+    });
+
+    setSlots(drafts.length ? drafts : [
+      {
+        index: 0,
+        date: "",
+        endDate: "",
         startTime: "18:00",
         endTime: "20:00",
-        selection: newEmptySelection(),
+        selection: defaultSelection(),
         selectedUserIds: [],
         roleByUserId: {},
         overrides: {},
-      };
-      return [...prev, syncSlotEndDate(s)];
+      },
+    ]);
+  }
+
+  function slotSelectionSummary(sel: TaskSelection) {
+    const parts: string[] = [];
+    parts.push(sel.claim ? CLAIM_LABEL[sel.claim] : "None");
+    const codes = (sel.codes ?? []) as TaskCode[];
+    if (codes.length) parts.push(codes.map((c) => TASK_LABEL[c]).join(" + "));
+    if (sel.custom?.enabled && (sel.custom as any)?.amount) {
+      parts.push(`Custom: ${(sel.custom as any).label || "Item"} (RM${(sel.custom as any).amount})`);
+    }
+    if (sel.note) parts.push(`Note: ${sel.note}`);
+    return parts.join(" · ");
+  }
+
+  const slotPreviews = useMemo(() => {
+    return slots.map((sl) => {
+      if (!sl.date) return [];
+
+      const isMultiDay = sl.selection.claim === "EVENT_2D1N" || sl.selection.claim === "EVENT_3D2N";
+      const endDateUsed = isMultiDay ? sl.endDate : sl.date;
+      if (!endDateUsed) return [];
+
+      const start = combineDateTime(sl.date, sl.startTime);
+      const end = combineDateTime(endDateUsed, sl.endTime);
+
+      const selectedUsers = users.filter((u) => sl.selectedUserIds.includes(u.id));
+
+      return selectedUsers.map((u) => {
+        const workRole = sl.roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
+        const rm = computeDefaultPayRM({ workRole, start, end, selection: sl.selection });
+        return { user: u, workRole, defaultRM: rm };
+      });
     });
-  }
-
-  function removeSlot(tempId: string) {
-    setSlots((prev) => {
-      if (prev.length <= 1) return prev; // must keep at least one
-      const next = prev.filter((s) => s.tempId !== tempId);
-      // re-index
-      return next.map((s, i) => ({ ...s, index: i }));
-    });
-  }
-
-  function updateSlot(tempId: string, patch: Partial<SlotForm>) {
-    setSlots((prev) =>
-      prev.map((s) => {
-        if (s.tempId !== tempId) return s;
-        const merged = { ...s, ...patch };
-        return syncSlotEndDate(merged);
-      })
-    );
-  }
-
-  function toggleUserInSlot(slotTempId: string, u: User) {
-    setSlots((prev) =>
-      prev.map((s) => {
-        if (s.tempId !== slotTempId) return s;
-
-        const exists = s.selectedUserIds.includes(u.id);
-        const selectedUserIds = exists ? s.selectedUserIds.filter((x) => x !== u.id) : [...s.selectedUserIds, u.id];
-
-        const roleByUserId = { ...s.roleByUserId };
-        if (!roleByUserId[u.id]) roleByUserId[u.id] = u.defaultWorkRole || "JUNIOR_MARSHAL";
-
-        // if removing, also remove overrides/role to keep state clean
-        if (exists) {
-          delete roleByUserId[u.id];
-          const overrides = { ...s.overrides };
-          delete overrides[u.id];
-          return { ...s, selectedUserIds, roleByUserId, overrides };
-        }
-
-        return { ...s, selectedUserIds, roleByUserId };
-      })
-    );
-  }
-
-  function getSlotPreview(slot: SlotForm) {
-    if (!slot.date) return [];
-    const multi = isMultiDayClaim(slot.selection.claim ?? null);
-    const endDateUsed = multi ? slot.endDate : slot.date;
-    if (multi && !endDateUsed) return [];
-
-    const start = combineDateTime(slot.date, slot.startTime);
-    const end = combineDateTime(endDateUsed, slot.endTime);
-
-    const selectedUsers = users.filter((u) => slot.selectedUserIds.includes(u.id));
-    return selectedUsers.map((u) => {
-      const workRole = slot.roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
-      const rm = computeDefaultPayRM({ workRole, start, end, selection: slot.selection });
-      return { user: u, workRole, defaultRM: rm };
-    });
-  }
+  }, [slots, users]);
 
   async function createOrUpdateEvent() {
     setMsg(null);
@@ -791,52 +845,66 @@ export default function ApprovedOTAdminPage() {
       return;
     }
 
-    for (const s of slots) {
-      const multi = isMultiDayClaim(s.selection.claim ?? null);
-      const endDateUsed = multi ? s.endDate : s.date;
+    // validate per slot
+    for (let i = 0; i < slots.length; i++) {
+      const sl = slots[i];
+      const slotNo = i + 1;
 
-      if (!s.date || (multi && !endDateUsed)) {
-        setMsg("Please fill date(s) for all slots.");
-        return;
-      }
-      if (multi && endDateUsed < s.date) {
-        setMsg("Slot end date cannot be earlier than start date.");
-        return;
-      }
-      if (s.selectedUserIds.length === 0) {
-        setMsg("Each slot must have at least 1 assigned user.");
+      if (!sl.date) {
+        setMsg(`Slot ${slotNo}: Please pick date.`);
         return;
       }
 
-      const start = combineDateTime(s.date, s.startTime);
-      const end = combineDateTime(endDateUsed, s.endTime);
+      const isMultiDay = sl.selection.claim === "EVENT_2D1N" || sl.selection.claim === "EVENT_3D2N";
+      const endDateUsed = isMultiDay ? sl.endDate : sl.date;
+      if (isMultiDay && !endDateUsed) {
+        setMsg(`Slot ${slotNo}: Please pick end date.`);
+        return;
+      }
+      if (endDateUsed < sl.date) {
+        setMsg(`Slot ${slotNo}: End date cannot be earlier than start date.`);
+        return;
+      }
+
+      if (!sl.selectedUserIds.length) {
+        setMsg(`Slot ${slotNo}: Please select at least 1 user.`);
+        return;
+      }
+
+      const start = combineDateTime(sl.date, sl.startTime);
+      const end = combineDateTime(endDateUsed, sl.endTime);
       if (!(end.getTime() > start.getTime())) {
-        setMsg("Slot end time must be later than start time.");
+        setMsg(`Slot ${slotNo}: End time must be after start time.`);
         return;
       }
     }
 
-    const payloadSlots = slots.map((s, idx) => {
-      const multi = isMultiDayClaim(s.selection.claim ?? null);
-      const endDateUsed = multi ? s.endDate : s.date;
+    const payloadSlots = slots.map((sl, idx) => {
+      const isMultiDay = sl.selection.claim === "EVENT_2D1N" || sl.selection.claim === "EVENT_3D2N";
+      const endDateUsed = isMultiDay ? sl.endDate : sl.date;
 
-      const start = combineDateTime(s.date, s.startTime);
-      const end = combineDateTime(endDateUsed, s.endTime);
+      const start = combineDateTime(sl.date, sl.startTime);
+      const end = combineDateTime(endDateUsed, sl.endTime);
 
-      const assignments = s.selectedUserIds.map((uid) => {
+      const assignments = sl.selectedUserIds.map((uid) => {
         const u = users.find((x) => x.id === uid);
-        const picked = s.roleByUserId[uid] || u?.defaultWorkRole || "JUNIOR_MARSHAL";
-        return { userId: uid, workRole: picked };
+        const workRole = sl.roleByUserId[uid] || u?.defaultWorkRole || "JUNIOR_MARSHAL";
+        const amountOverrideRM = sl.overrides[uid] ?? null;
+
+        return {
+          userId: uid,
+          workRole,
+          amountOverrideRM,
+        };
       });
 
       return {
-        id: s.id, // undefined for new slot
+        id: sl.id,
         index: idx,
         startTime: start.toISOString(),
         endTime: end.toISOString(),
-        selection: s.selection,
+        selection: sl.selection,
         assignments,
-        overrides: s.overrides,
       };
     });
 
@@ -847,7 +915,7 @@ export default function ApprovedOTAdminPage() {
       method,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        project,
+        project: project.trim(),
         remark: remark || null,
         slots: payloadSlots,
       }),
@@ -865,7 +933,7 @@ export default function ApprovedOTAdminPage() {
   }
 
   async function deleteEvent(eventId: string) {
-    const ok = confirm("Delete this Approved OT event? This will remove slots & assignments too.");
+    const ok = confirm("Delete this Approved OT event? This will remove slots + assignments too.");
     if (!ok) return;
 
     setMsg(null);
@@ -894,67 +962,7 @@ export default function ApprovedOTAdminPage() {
     await loadAll();
   }
 
-  function fillFormFromEvent(ev: OtEvent) {
-    setEditingEventId(ev.id);
-    setProject(ev.project || "");
-    setRemark(ev.remark || "");
-
-    const slotForms: SlotForm[] = (ev.slots || [])
-      .slice()
-      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
-      .map((sl, i) => {
-        const start = new Date(sl.startTime);
-        const end = new Date(sl.endTime);
-
-        const sel = safeParseSelection(sl.taskCodes || "{}");
-
-        const selectedUserIds = (sl.assignments || []).map((a) => a.userId).filter(Boolean);
-
-        const roleByUserId: Record<string, WorkRole> = {};
-        const overrides: Record<string, string> = {};
-        for (const a of sl.assignments || []) {
-          roleByUserId[a.userId] = a.workRole;
-          if (a.amountOverride !== null && a.amountOverride !== undefined) {
-            overrides[a.userId] = (Number(a.amountOverride) / 100).toFixed(2);
-          }
-        }
-
-        // legacy pseudo-slot id starts with "__legacy__" (backend will do this)
-        const realId = sl.id?.startsWith("__legacy__") ? undefined : sl.id;
-
-        const s: SlotForm = {
-          tempId: makeTempId(),
-          id: realId,
-          index: i,
-          date: isoDateOnly(start),
-          endDate: isoDateOnly(end),
-          startTime: hhmmFromIso(sl.startTime),
-          endTime: hhmmFromIso(sl.endTime),
-          selection: sel,
-          selectedUserIds,
-          roleByUserId,
-          overrides,
-        };
-        return syncSlotEndDate(s);
-      });
-
-    setSlots(slotForms.length ? slotForms : [
-      {
-        tempId: makeTempId(),
-        index: 0,
-        date: "",
-        endDate: "",
-        startTime: "18:00",
-        endTime: "20:00",
-        selection: newEmptySelection(),
-        selectedUserIds: [],
-        roleByUserId: {},
-        overrides: {},
-      },
-    ]);
-  }
-
-  /* ---------------- Export approved OT to CSV (slot-aware) ---------------- */
+  /* ---------------- Export existing approved OT to CSV (slot-based) ---------------- */
   async function exportToCsv() {
     try {
       setExportBusy(true);
@@ -972,23 +980,23 @@ export default function ApprovedOTAdminPage() {
 
       const headers = [
         "Project",
-        "Remark",
+        "EventId",
         "SlotIndex",
+        "SlotId",
         "SlotStartDate",
         "SlotEndDate",
         "SlotStartTime",
         "SlotEndTime",
-        "TaskSummary",
-        "Breakdown",
+        "Remark",
         "UserName",
         "UserEmail",
         "WorkRole",
+        "TaskSummary",
+        "Breakdown",
         "DefaultRM",
         "OverrideRM",
         "EffectiveRM",
         "Status",
-        "EventId",
-        "SlotId",
         "AssignmentId",
       ];
 
@@ -996,9 +1004,16 @@ export default function ApprovedOTAdminPage() {
       rows.push(headers.map(csvEscape).join(","));
 
       for (const ev of evs) {
-        const sortedSlots = (ev.slots || []).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+        const sls = (ev.slots && ev.slots.length ? ev.slots : [{
+          id: `legacy-${ev.id}`,
+          index: 0,
+          startTime: ev.startTime,
+          endTime: ev.endTime,
+          taskCodes: ev.taskCodes,
+          assignments: ev.assignments || [],
+        }]) as any as OtSlot[];
 
-        for (const sl of sortedSlots) {
+        for (const sl of sls) {
           const sel = safeParseSelection(sl.taskCodes || "{}");
 
           const taskSummary = [
@@ -1006,9 +1021,7 @@ export default function ApprovedOTAdminPage() {
             sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
             sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
             sel.note ? `Note: ${sel.note}` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ");
+          ].filter(Boolean).join(" · ");
 
           const start = new Date(sl.startTime);
           const end = new Date(sl.endTime);
@@ -1032,23 +1045,23 @@ export default function ApprovedOTAdminPage() {
 
             const line = [
               ev.project || "",
-              ev.remark || "",
+              ev.id,
               String(sl.index ?? 0),
+              sl.id,
               startDateLabel,
               endDateLabel,
               toLocalTime(start),
               toLocalTime(end),
-              taskSummary,
-              breakdownInline,
+              ev.remark || "",
               a.user?.name || "",
               a.user?.email || "",
               WORK_ROLE_LABEL[a.workRole] || a.workRole,
+              taskSummary,
+              breakdownInline,
               centsToRm(defaultCents),
               overrideCents === null ? "" : centsToRm(overrideCents),
               centsToRm(effectiveCents),
               a.status,
-              ev.id,
-              sl.id,
               a.id,
             ];
 
@@ -1068,8 +1081,7 @@ export default function ApprovedOTAdminPage() {
     }
   }
 
-  // modal selection binding
-  const activeSlot = useMemo(() => slots.find((s) => s.tempId === activeSlotTempId) || null, [slots, activeSlotTempId]);
+  const activeSelection = slots[activeSlotIndex]?.selection ?? defaultSelection();
 
   return (
     <div className="space-y-6 text-gray-900">
@@ -1101,237 +1113,230 @@ export default function ApprovedOTAdminPage() {
           )}
         </div>
 
+        {/* Event-level fields */}
         <div className="grid md:grid-cols-2 gap-4">
-          <div className="space-y-3">
-            <div>
-              <label className="text-sm font-semibold">Event / Project</label>
-              <input
-                className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
-                value={project}
-                onChange={(e) => setProject(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="text-sm font-semibold">Remark</label>
-              <input
-                className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
-                value={remark}
-                onChange={(e) => setRemark(e.target.value)}
-              />
-            </div>
-
-            <div className="border-2 border-black rounded-xl p-3 bg-gray-50">
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-semibold">Time Slots</div>
-                <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={addSlot}>
-                  + Add slot
-                </button>
-              </div>
-              <div className="text-xs text-gray-700 mt-1">Each slot can have its own time range, task selection, and assigned people.</div>
-            </div>
+          <div>
+            <label className="text-sm font-semibold">Event / Project</label>
+            <input
+              className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
+              value={project}
+              onChange={(e) => setProject(e.target.value)}
+            />
           </div>
-
-          <div className="space-y-3">
-            <button className="w-full rounded bg-black text-white py-2 hover:opacity-90 border-2 border-black" onClick={createOrUpdateEvent}>
-              {editingEventId ? "Save Changes" : "Create Approved OT"}
-            </button>
-            <div className="text-xs text-gray-700">
-              Rules: at least <b>1 slot</b>; each slot must have <b>date/time</b> and at least <b>1 user</b>.
-            </div>
+          <div>
+            <label className="text-sm font-semibold">Remark</label>
+            <input
+              className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900 placeholder:text-gray-400"
+              value={remark}
+              onChange={(e) => setRemark(e.target.value)}
+            />
           </div>
         </div>
 
-        {/* Slots editor */}
+        {/* Slots */}
         <div className="space-y-4">
-          {slots.map((sl) => {
-            const multi = isMultiDayClaim(sl.selection.claim ?? null);
-            const preview = getSlotPreview(sl);
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold">Time Slots</div>
+            <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900" onClick={addSlot}>
+              + Add Slot
+            </button>
+          </div>
+
+          {slots.map((sl, idx) => {
+            const isMultiDay = sl.selection.claim === "EVENT_2D1N" || sl.selection.claim === "EVENT_3D2N";
+            const summary = slotSelectionSummary(sl.selection);
 
             return (
-              <div key={sl.tempId} className="border-2 border-black rounded-xl overflow-hidden">
-                <div className="p-3 border-b-2 border-black flex items-start justify-between gap-3 bg-white">
-                  <div className="min-w-0">
-                    <div className="font-semibold">Slot #{sl.index + 1}</div>
-                    <div className="text-xs text-gray-700 mt-1">{slotSelectionSummary(sl.selection)}</div>
-                  </div>
+              <div key={idx} className="border-2 border-black rounded-xl p-4 bg-white space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">Slot #{idx + 1}</div>
+                  {slots.length > 1 && (
+                    <button className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-red-600" onClick={() => removeSlot(idx)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
 
-                  <div className="flex gap-2 shrink-0">
+                {/* Slot task */}
+                <div>
+                  <label className="text-sm font-semibold">Task Description</label>
+                  <div className="flex gap-2">
                     <button
                       type="button"
-                      className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-gray-900"
-                      onClick={() => openSlotModal(sl.tempId)}
+                      className="px-3 py-2 border-2 border-black rounded bg-white text-gray-900"
+                      onClick={() => {
+                        setActiveSlotIndex(idx);
+                        setModalOpen(true);
+                      }}
                     >
                       Select tasks
                     </button>
-                    <button
-                      type="button"
-                      className="text-sm px-3 py-1.5 border-2 border-black rounded bg-white text-red-600 disabled:opacity-60"
-                      disabled={slots.length <= 1}
-                      onClick={() => removeSlot(sl.tempId)}
-                      title={slots.length <= 1 ? "At least one slot is required" : "Remove this slot"}
-                    >
-                      Remove
-                    </button>
+                  </div>
+                  <div className="text-xs text-gray-700 mt-2">{summary}</div>
+                </div>
+
+                {/* Slot date(s) */}
+                {!isMultiDay ? (
+                  <div>
+                    <label className="text-sm font-semibold">Date</label>
+                    <input
+                      className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                      type="date"
+                      value={sl.date}
+                      onChange={(e) => updateSlot(idx, { date: e.target.value })}
+                    />
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-sm font-semibold">Start Date</label>
+                      <input
+                        className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                        type="date"
+                        value={sl.date}
+                        onChange={(e) => updateSlot(idx, { date: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <label className="text-sm font-semibold">End Date</label>
+                      <input
+                        className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                        type="date"
+                        value={sl.endDate}
+                        min={sl.date || undefined}
+                        onChange={(e) => updateSlot(idx, { endDate: e.target.value })}
+                      />
+                    </div>
+                    <div className="md:col-span-2 text-xs text-gray-700">
+                      For <b>2D1N</b> / <b>3D2N</b>, pick both start & end dates.
+                    </div>
+                  </div>
+                )}
+
+                {/* Slot time */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-sm font-semibold">Start Time</label>
+                    <input
+                      className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                      type="time"
+                      value={sl.startTime}
+                      onChange={(e) => updateSlot(idx, { startTime: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm font-semibold">End Time</label>
+                    <input
+                      className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
+                      type="time"
+                      value={sl.endTime}
+                      onChange={(e) => updateSlot(idx, { endTime: e.target.value })}
+                    />
                   </div>
                 </div>
 
-                <div className="p-4 grid md:grid-cols-2 gap-4 bg-white">
-                  {/* Slot time */}
-                  <div className="space-y-3">
-                    {!multi ? (
-                      <div>
-                        <label className="text-sm font-semibold">Date</label>
-                        <input
-                          className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                          type="date"
-                          value={sl.date}
-                          onChange={(e) => updateSlot(sl.tempId, { date: e.target.value })}
-                        />
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <div>
-                          <label className="text-sm font-semibold">Start Date</label>
-                          <input
-                            className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                            type="date"
-                            value={sl.date}
-                            onChange={(e) => updateSlot(sl.tempId, { date: e.target.value })}
-                          />
-                        </div>
-                        <div>
-                          <label className="text-sm font-semibold">End Date</label>
-                          <input
-                            className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                            type="date"
-                            value={sl.endDate}
-                            min={sl.date || undefined}
-                            onChange={(e) => updateSlot(sl.tempId, { endDate: e.target.value })}
-                          />
-                        </div>
-                        <div className="md:col-span-2 text-xs text-gray-700">
-                          For <b>2D1N</b> / <b>3D2N</b>, pick both start & end dates.
-                        </div>
-                      </div>
-                    )}
+                {/* Slot user select */}
+                <div className="text-sm font-semibold">Assign users (per slot)</div>
+                <div className="max-h-56 overflow-auto border-2 border-black rounded p-2 bg-gray-50 space-y-2">
+                  {users.map((u) => {
+                    const checked = sl.selectedUserIds.includes(u.id);
+                    const currentRole = sl.roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
 
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="text-sm font-semibold">Start Time</label>
-                        <input
-                          className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                          type="time"
-                          value={sl.startTime}
-                          onChange={(e) => updateSlot(sl.tempId, { startTime: e.target.value })}
-                        />
-                      </div>
-                      <div>
-                        <label className="text-sm font-semibold">End Time</label>
-                        <input
-                          className="w-full border-2 border-black rounded px-3 py-2 bg-white text-gray-900"
-                          type="time"
-                          value={sl.endTime}
-                          onChange={(e) => updateSlot(sl.tempId, { endTime: e.target.value })}
-                        />
-                      </div>
-                    </div>
-                  </div>
+                    return (
+                      <div key={u.id} className="flex items-center justify-between gap-2 bg-white border-2 border-black rounded px-2 py-2">
+                        <label className="flex items-center gap-2 text-sm text-gray-900">
+                          <input type="checkbox" checked={checked} onChange={() => toggleUserInSlot(idx, u)} />
+                          <span className="font-medium">{u.name}</span>
+                        </label>
 
-                  {/* Slot assignment */}
-                  <div className="space-y-3">
-                    <div className="text-sm font-semibold">Assign Users (this slot)</div>
-
-                    <div className="max-h-56 overflow-auto border-2 border-black rounded p-2 bg-gray-50 space-y-2">
-                      {users.map((u) => {
-                        const checked = sl.selectedUserIds.includes(u.id);
-                        const currentRole = sl.roleByUserId[u.id] || u.defaultWorkRole || "JUNIOR_MARSHAL";
-                        return (
-                          <div key={u.id} className="flex items-center justify-between gap-2 bg-white border-2 border-black rounded px-2 py-2">
-                            <label className="flex items-center gap-2 text-sm text-gray-900">
-                              <input type="checkbox" checked={checked} onChange={() => toggleUserInSlot(sl.tempId, u)} />
-                              <span className="font-medium">{u.name}</span>
-                            </label>
-
-                            <select
-                              className="border-2 border-black rounded px-2 py-1 text-sm bg-white text-gray-900"
-                              disabled={!checked}
-                              value={currentRole}
-                              onChange={(e) =>
-                                updateSlot(sl.tempId, {
-                                  roleByUserId: { ...sl.roleByUserId, [u.id]: e.target.value as WorkRole },
-                                })
-                              }
-                            >
-                              {workRoleOptions.map((r) => (
-                                <option key={r} value={r}>
-                                  {WORK_ROLE_LABEL[r]}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    <div className="text-sm font-semibold">Pay Amount (default → editable)</div>
-                    <div className="border-2 border-black rounded overflow-hidden bg-white">
-                      <table className="w-full text-sm">
-                        <thead className="bg-gray-50">
-                          <tr>
-                            <th className="text-left p-2">User</th>
-                            <th className="text-left p-2">Role</th>
-                            <th className="text-right p-2">Default (RM)</th>
-                            <th className="text-right p-2">Override (RM)</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {preview.map((p) => (
-                            <tr key={p.user.id} className="border-t bg-white">
-                              <td className="p-2 text-gray-900">{p.user.name}</td>
-                              <td className="p-2 text-xs text-gray-900">{WORK_ROLE_LABEL[p.workRole]}</td>
-                              <td className="p-2 text-right text-gray-900">{Number.isFinite(p.defaultRM) ? p.defaultRM.toFixed(2) : "0.00"}</td>
-                              <td className="p-2 text-right">
-                                <input
-                                  className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
-                                  placeholder="(auto)"
-                                  value={sl.overrides[p.user.id] ?? ""}
-                                  onChange={(e) =>
-                                    updateSlot(sl.tempId, {
-                                      overrides: { ...sl.overrides, [p.user.id]: e.target.value },
-                                    })
-                                  }
-                                />
-                              </td>
-                            </tr>
+                        <select
+                          className="border-2 border-black rounded px-2 py-1 text-sm bg-white text-gray-900"
+                          disabled={!checked}
+                          value={currentRole}
+                          onChange={(e) => {
+                            const val = e.target.value as WorkRole;
+                            setSlots((prev) => {
+                              const next = [...prev];
+                              const s2 = next[idx];
+                              if (!s2) return prev;
+                              next[idx] = { ...s2, roleByUserId: { ...s2.roleByUserId, [u.id]: val } };
+                              return next;
+                            });
+                          }}
+                        >
+                          {workRoleOptions.map((r) => (
+                            <option key={r} value={r}>
+                              {WORK_ROLE_LABEL[r]}
+                            </option>
                           ))}
-                          {preview.length === 0 && (
-                            <tr>
-                              <td className="p-3 text-gray-700" colSpan={4}>
-                                Select task + date(s) + users to preview default pay
-                              </td>
-                            </tr>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Slot pay preview */}
+                <div className="text-sm font-semibold">Pay Amount (default → editable) — Slot #{idx + 1}</div>
+                <div className="border-2 border-black rounded overflow-hidden bg-white">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="text-left p-2">User</th>
+                        <th className="text-left p-2">Role</th>
+                        <th className="text-right p-2">Default (RM)</th>
+                        <th className="text-right p-2">Override (RM)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {slotPreviews[idx]?.map((p) => (
+                        <tr key={p.user.id} className="border-t bg-white">
+                          <td className="p-2 text-gray-900">{p.user.name}</td>
+                          <td className="p-2 text-xs text-gray-900">{WORK_ROLE_LABEL[p.workRole]}</td>
+                          <td className="p-2 text-right text-gray-900">{Number.isFinite(p.defaultRM) ? p.defaultRM.toFixed(2) : "0.00"}</td>
+                          <td className="p-2 text-right">
+                            <input
+                              className="w-28 border-2 border-black rounded px-2 py-1 text-right bg-white text-gray-900 placeholder:text-gray-400"
+                              placeholder="(auto)"
+                              value={sl.overrides[p.user.id] ?? ""}
+                              onChange={(e) => {
+                                const v = e.target.value;
+                                setSlots((prev) => {
+                                  const next = [...prev];
+                                  const s2 = next[idx];
+                                  if (!s2) return prev;
+                                  next[idx] = { ...s2, overrides: { ...s2.overrides, [p.user.id]: v } };
+                                  return next;
+                                });
+                              }}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                      {(slotPreviews[idx]?.length ?? 0) === 0 && (
+                        <tr>
+                          <td className="p-3 text-gray-700" colSpan={4}>
+                            Select task + date(s) + users to preview default pay
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             );
           })}
         </div>
+
+        <button className="w-full rounded bg-black text-white py-2 hover:opacity-90 border-2 border-black" onClick={createOrUpdateEvent}>
+          {editingEventId ? "Save Changes" : "Create Approved OT"}
+        </button>
       </div>
 
-      {/* Task modal */}
       <TaskModal
         open={modalOpen}
         onClose={() => setModalOpen(false)}
-        selection={activeSlot?.selection || newEmptySelection()}
-        setSelection={(sel) => {
-          if (!activeSlotTempId) return;
-          updateSlot(activeSlotTempId, { selection: sel });
-        }}
+        selection={activeSelection}
+        setSelection={(sel) => updateSlot(activeSlotIndex, { selection: sel })}
       />
 
       {/* Existing events */}
@@ -1339,15 +1344,34 @@ export default function ApprovedOTAdminPage() {
         <div className="text-lg font-semibold">Existing Approved OT</div>
 
         {events.map((ev) => {
-          const sortedSlots = (ev.slots || []).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+          const s = new Date(ev.startTime);
+          const e = new Date(ev.endTime);
+          const startDateLabel = s.toLocaleDateString();
+          const endDateLabel = e.toLocaleDateString();
+          const sameDay = startDateLabel === endDateLabel;
+          const dateLabel = sameDay ? startDateLabel : `${startDateLabel} → ${endDateLabel}`;
+          const titleLeft = `${dateLabel} — ${ev.project}`;
+
+          const timeRange = sameDay
+            ? `${toLocalTime(s)} - ${toLocalTime(e)}`
+            : `${startDateLabel} ${toLocalTime(s)} - ${endDateLabel} ${toLocalTime(e)}`;
+
+          const sls = (ev.slots && ev.slots.length ? ev.slots : [{
+            id: `legacy-${ev.id}`,
+            index: 0,
+            startTime: ev.startTime,
+            endTime: ev.endTime,
+            taskCodes: ev.taskCodes,
+            assignments: ev.assignments || [],
+          }]) as any as OtSlot[];
 
           return (
             <div key={ev.id} className="bg-white border-2 border-black rounded-xl overflow-hidden">
               <div className="p-4 border-b-2 border-black flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
                 <div className="text-gray-900">
-                  <div className="font-semibold">{ev.project}</div>
+                  <div className="font-semibold">{titleLeft}</div>
+                  <div className="text-xs text-gray-700">{timeRange}</div>
                   {ev.remark && <div className="text-xs text-gray-700 mt-1">Remark: {ev.remark}</div>}
-                  <div className="text-xs text-gray-700 mt-1">Slots: {sortedSlots.length}</div>
                 </div>
 
                 <div className="flex gap-2">
@@ -1361,34 +1385,19 @@ export default function ApprovedOTAdminPage() {
               </div>
 
               <div className="p-4 space-y-4">
-                {sortedSlots.map((sl) => {
+                {sls.map((sl) => {
                   const sel = safeParseSelection(sl.taskCodes || "{}");
-                  const s = new Date(sl.startTime);
-                  const e = new Date(sl.endTime);
+                  const ss = new Date(sl.startTime);
+                  const ee = new Date(sl.endTime);
 
-                  const dateLabel = isoDateOnly(s) === isoDateOnly(e)
-                    ? isoDateOnly(s)
-                    : `${isoDateOnly(s)} → ${isoDateOnly(e)}`;
-
-                  const timeRange = isoDateOnly(s) === isoDateOnly(e)
-                    ? `${toLocalTime(s)} - ${toLocalTime(e)}`
-                    : `${isoDateOnly(s)} ${toLocalTime(s)} - ${isoDateOnly(e)} ${toLocalTime(e)}`;
-
-                  const selSummary = [
-                    sel.claim ? CLAIM_LABEL[sel.claim] : "None",
-                    sel.codes?.length ? sel.codes.map((c) => TASK_LABEL[c]).join(" + ") : null,
-                    sel.custom?.enabled ? `Custom: ${(sel.custom as any)?.label || "Item"} (RM${(sel.custom as any)?.amount})` : null,
-                    sel.note ? `Note: ${sel.note}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ");
+                  const slotHeader = `Slot #${(sl.index ?? 0) + 1} — ${ss.toLocaleDateString()} ${toLocalTime(ss)} → ${ee.toLocaleDateString()} ${toLocalTime(ee)}`;
+                  const selSummary = slotSelectionSummary(sel);
 
                   return (
                     <div key={sl.id} className="border-2 border-black rounded-xl overflow-hidden">
                       <div className="p-3 border-b-2 border-black bg-gray-50">
-                        <div className="font-semibold">Slot #{(sl.index ?? 0) + 1} — {dateLabel}</div>
-                        <div className="text-xs text-gray-700">{timeRange}</div>
-                        <div className="text-xs text-gray-900 mt-1">{selSummary}</div>
+                        <div className="font-semibold text-sm">{slotHeader}</div>
+                        <div className="text-xs text-gray-700 mt-1">{selSummary}</div>
                       </div>
 
                       <div className="p-3">
@@ -1414,8 +1423,8 @@ export default function ApprovedOTAdminPage() {
 
                                 const breakdown = buildTaskPayBreakdown({
                                   workRole: a.workRole,
-                                  start: s,
-                                  end: e,
+                                  start: ss,
+                                  end: ee,
                                   selection: sel,
                                 });
 
@@ -1477,6 +1486,10 @@ export default function ApprovedOTAdminPage() {
         })}
 
         {events.length === 0 && <div className="text-sm text-gray-700">No Approved OT yet.</div>}
+      </div>
+
+      <div className="text-xs text-gray-700">
+        Note: This page now uses <code className="ml-1">slots[]</code> in POST/PATCH. Your assignment PATCH endpoint remains unchanged.
       </div>
     </div>
   );
