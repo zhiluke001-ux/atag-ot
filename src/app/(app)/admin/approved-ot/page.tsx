@@ -186,9 +186,18 @@ function hhmmFromIso(iso: string) {
   return `${hh}:${mm}`;
 }
 
-// ✅ Date format: DD Mon YYYY
-function toLocalDateShort(d: Date) {
-  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+function toDMY2(d: Date) {
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yy = String(d.getFullYear()).slice(-2);
+  return `${dd}/${mm}/${yy}`;
+}
+
+function isoYMDToDMY2(ymd: string) {
+  // ymd is "YYYY-MM-DD"
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || "");
+  if (!m) return ymd || "";
+  return `${m[3]}/${m[2]}/${m[1].slice(-2)}`;
 }
 
 function toLocalTime(d: Date) {
@@ -1317,13 +1326,16 @@ export default function ApprovedOTAdminPage() {
 
   function eventSummary(ev: OtEvent) {
     const sls = normalizeSlots(ev);
-    const slotDates = Array.from(
+    const isoKeys = Array.from(
       new Set(
-        sls
-          .flatMap((sl) => [isoDateOnly(new Date(sl.startTime)), isoDateOnly(new Date(sl.endTime))])
-          .filter(Boolean)
+        sls.flatMap((sl) => [
+          isoDateOnly(new Date(sl.startTime)),
+          isoDateOnly(new Date(sl.endTime)),
+        ])
       )
-    ).sort();
+    ).sort(); // ISO sorts correctly
+    
+    const slotDates = isoKeys.map(isoYMDToDMY2); // ✅ display as DD/MM/YY
 
     const allAssignments = sls.flatMap((sl) => sl.assignments || []);
     const unpaidCount = allAssignments.filter((a) => a.status === "UNPAID").length;
@@ -1455,8 +1467,11 @@ export default function ApprovedOTAdminPage() {
               {slots.map((sl, idx) => {
                 const isExpanded = expanded.has(sl.tempId);
                 const se = getSlotStartEnd(sl);
-                const dateLabel = se ? `${toLocalDateShort(se.start)}${isoDateOnly(se.start) !== isoDateOnly(se.end) ? ` → ${toLocalDateShort(se.end)}` : ""}` : "No date";
-                const timeLabel = se ? `${toLocalTime(se.start)} – ${toLocalTime(se.end)}` : "No time";
+                const dateLabel = se
+                  ? (isoDateOnly(se.start) === isoDateOnly(se.end)
+                      ? toDMY2(se.start)
+                      : `${toDMY2(se.start)} → ${toDMY2(se.end)}`)
+                  : "No date";                const timeLabel = se ? `${toLocalTime(se.start)} – ${toLocalTime(se.end)}` : "No time";
                 const taskLabel = slotSelectionSummary(sl.selection);
                 const comp = slotComputed.get(sl.tempId);
                 const totalRM = comp?.totalRM ?? 0;
@@ -1786,8 +1801,8 @@ export default function ApprovedOTAdminPage() {
                           const s = new Date(sl.startTime);
                           const e = new Date(sl.endTime);
 
-                          const head = `${(sl.index ?? 0) + 1}. ${toLocalDateShort(s)} ${toLocalTime(s)} → ${
-                            isoDateOnly(s) === isoDateOnly(e) ? toLocalTime(e) : `${toLocalDateShort(e)} ${toLocalTime(e)}`
+                          const head = `${toDMY2(s)} ${toLocalTime(s)} → ${
+                            isoDateOnly(s) === isoDateOnly(e) ? toLocalTime(e) : `${toDMY2(e)} ${toLocalTime(e)}`
                           }`;
 
                           const slotAssignments = sl.assignments || [];
