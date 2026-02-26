@@ -17,7 +17,8 @@ export type TaskCode =
   | "BACKEND_RM15" // per hour
   | "EVENT_AFTER_6PM" // per hour (single amount)
   | "EARLY_CALLING_RM30" // flat
-  | "LOADING_UNLOADING_RM30"; // flat
+  | "LOADING_UNLOADING_RM30" // flat
+  | "GOOGLE_REVIEW_RM10"；
 
 export type TaskSelection = {
   // base claim (0 or 1)
@@ -49,6 +50,7 @@ export type TaskSelection = {
     after6pmPerHour: string | number; // default 30 (admin can change to 20, etc)
     earlyCallingFlat: string | number; // default 30
     loadingUnloadingFlat: string | number; // default 30
+    googleReviewFlat: string | number;
   }>;
 
   /**
@@ -81,6 +83,7 @@ export const TASK_LABEL: Record<TaskCode, string> = {
   EVENT_AFTER_6PM: "Event starts after 6PM (per hour)",
   EARLY_CALLING_RM30: "Early Calling (flat)",
   LOADING_UNLOADING_RM30: "Loading & Unloading (flat)",
+  GOOGLE_REVIEW_RM10: "Google Review (RM10)",
 };
 
 function toNumber(v: unknown, fallback: number): number {
@@ -126,6 +129,7 @@ const DEFAULT_ADDON = {
   after6pmPerHour: 30, // admin can change to 20 if needed
   earlyCallingFlat: 30,
   loadingUnloadingFlat: 30,
+  googleReviewFlat: 10,
 };
 
 export function resolveBaseRates(claim: ClaimCode, selection?: TaskSelection) {
@@ -147,6 +151,7 @@ export function resolveAddOnRates(selection?: TaskSelection) {
     after6pmPerHour: toNumber(o.after6pmPerHour, DEFAULT_ADDON.after6pmPerHour),
     earlyCallingFlat: toNumber(o.earlyCallingFlat, DEFAULT_ADDON.earlyCallingFlat),
     loadingUnloadingFlat: toNumber(o.loadingUnloadingFlat, DEFAULT_ADDON.loadingUnloadingFlat),
+    googleReviewFlat: toNumber(o.googleReviewFlat, DEFAULT_ADDON.googleReviewFlat),
   };
 }
 
@@ -200,6 +205,7 @@ export function computeDefaultPayRM(args: {
     if (code === "EVENT_AFTER_6PM") total += (startsAfter6pm ? hrs : 0) * add.after6pmPerHour;
     if (code === "EARLY_CALLING_RM30") total += add.earlyCallingFlat;
     if (code === "LOADING_UNLOADING_RM30") total += add.loadingUnloadingFlat;
+    if (code === "GOOGLE_REVIEW_RM10") total += add.googleReviewFlat;
   }
 
   // Custom line item (flat)
