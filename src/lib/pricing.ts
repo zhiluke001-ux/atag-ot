@@ -18,7 +18,7 @@ export type TaskCode =
   | "EVENT_AFTER_6PM" // per hour (single amount)
   | "EARLY_CALLING_RM30" // flat
   | "LOADING_UNLOADING_RM30" // flat
-  | "GOOGLE_REVIEW_RM10"；
+  | "GOOGLE_REVIEW_RM10";
 
 export type TaskSelection = {
   // base claim (0 or 1)
