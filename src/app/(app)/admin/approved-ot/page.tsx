@@ -186,8 +186,9 @@ function hhmmFromIso(iso: string) {
   return `${hh}:${mm}`;
 }
 
+// ✅ Date format: DD Mon YYYY
 function toLocalDateShort(d: Date) {
-  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 }
 
 function toLocalTime(d: Date) {
@@ -246,15 +247,13 @@ function isMultiDayClaim(claim: ClaimCode | null) {
   return claim === "EVENT_2D1N" || claim === "EVENT_3D2N";
 }
 
-function isMultiDayClaimCode(
-  c: ClaimCode | null
-): c is "EVENT_2D1N" | "EVENT_3D2N" {
+// ✅ TS-safe guard for CLAIM_LABEL indexing
+function isMultiDayClaimCode(c: ClaimCode | null): c is "EVENT_2D1N" | "EVENT_3D2N" {
   return c === "EVENT_2D1N" || c === "EVENT_3D2N";
 }
 
 function normalizeSlots(ev: OtEvent): OtSlot[] {
   if (ev.slots && ev.slots.length) return ev.slots;
-  // legacy fallback (old events without slots)
   return [
     {
       id: `legacy-${ev.id}`,
@@ -353,6 +352,12 @@ function buildTaskPayBreakdown(args: {
       const amt = round2(toNum(add?.loadingUnloadingFlat, 0));
       if (amt > 0) lines.push({ label: "Loading & Unloading", amountRM: amt });
     }
+
+    // ✅ NEW
+    if (code === "GOOGLE_REVIEW_RM10") {
+      const amt = round2(toNum(add?.googleReviewFlat, 10));
+      if (amt > 0) lines.push({ label: "Google Review", amountRM: amt });
+    }
   }
 
   // Custom
@@ -371,7 +376,7 @@ function formatBreakdownInline(lines: { label: string; amountRM: number }[]) {
   return lines.map((x) => `${x.label} (RM${x.amountRM.toFixed(2)})`).join(" + ");
 }
 
-/* ---------------- CSV Export helpers ---------------- */
+/* ---------------- CSV helpers ---------------- */
 
 function csvEscape(v: unknown) {
   const s = String(v ?? "");
@@ -422,9 +427,12 @@ function TaskModal({
     rateKey: keyof NonNullable<TaskSelection["addOnRates"]>;
   }[] = [
     { code: "BACKEND_RM15", left: "Backend — Annual Dinner / Karaoke / Packing / Set Up", unit: "perHour", rateKey: "backendPerHour" },
-    { code: "EVENT_AFTER_6PM", left: "Event starts after 6PM (RM30 | RM20 per hour)", unit: "perHour", rateKey: "after6pmPerHour" },
+    { code: "EVENT_AFTER_6PM", left: "Event starts after 6PM (per hour)", unit: "perHour", rateKey: "after6pmPerHour" },
     { code: "EARLY_CALLING_RM30", left: "Early Calling", unit: "flat", rateKey: "earlyCallingFlat" },
     { code: "LOADING_UNLOADING_RM30", left: "Loading & Unloading", unit: "flat", rateKey: "loadingUnloadingFlat" },
+
+    // ✅ NEW
+    { code: "GOOGLE_REVIEW_RM10", left: "Google Review (RM10)", unit: "flat", rateKey: "googleReviewFlat" },
   ];
 
   function toggleCode(code: TaskCode) {
@@ -570,7 +578,9 @@ function TaskModal({
                     ? add?.after6pmPerHour
                     : row.rateKey === "earlyCallingFlat"
                     ? add?.earlyCallingFlat
-                    : add?.loadingUnloadingFlat);
+                    : row.rateKey === "loadingUnloadingFlat"
+                    ? add?.loadingUnloadingFlat
+                    : add?.googleReviewFlat);
 
                 return (
                   <div key={row.code} className="border border-gray-200 rounded-lg p-3 flex items-center justify-between gap-3 bg-white">
@@ -679,7 +689,7 @@ function TaskModal({
   );
 }
 
-/* ---------------- User Picker Modal (cleaner UX) ---------------- */
+/* ---------------- User Picker Modal (same as before) ---------------- */
 
 function UserPickerModal({
   open,
@@ -816,6 +826,7 @@ function UserPickerModal({
     </div>
   );
 }
+
 
 /* ---------------- Page ---------------- */
 
