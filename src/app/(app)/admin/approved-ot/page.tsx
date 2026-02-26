@@ -246,6 +246,12 @@ function isMultiDayClaim(claim: ClaimCode | null) {
   return claim === "EVENT_2D1N" || claim === "EVENT_3D2N";
 }
 
+function isMultiDayClaimCode(
+  c: ClaimCode | null
+): c is "EVENT_2D1N" | "EVENT_3D2N" {
+  return c === "EVENT_2D1N" || c === "EVENT_3D2N";
+}
+
 function normalizeSlots(ev: OtEvent): OtSlot[] {
   if (ev.slots && ev.slots.length) return ev.slots;
   // legacy fallback (old events without slots)
@@ -1093,8 +1099,12 @@ export default function ApprovedOTAdminPage() {
     slots.forEach((s, i) => {
       const n = i + 1;
       if (!s.date) errors.push(`Slot ${n}: date is required.`);
-      const multi = isMultiDayClaim(s.selection.claim ?? null);
-      if (multi && !s.endDate) errors.push(`Slot ${n}: end date is required for ${CLAIM_LABEL[s.selection.claim as any]}.`);
+      const claim = (s.selection.claim ?? null) as ClaimCode | null;
+      const multi = isMultiDayClaimCode(claim);
+      
+      if (multi && !s.endDate) {
+        errors.push(`Slot ${n}: end date is required for ${CLAIM_LABEL[claim]}.`);
+      }
       if (multi && s.endDate && s.endDate < s.date) errors.push(`Slot ${n}: end date cannot be earlier than start date.`);
       const se = getSlotStartEnd(s);
       if (se && !(se.end.getTime() > se.start.getTime())) errors.push(`Slot ${n}: end time must be after start time.`);
